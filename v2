@@ -1,6 +1,3 @@
-I’ve added a small L2 penalizer to the CoxPH fit (to resolve collinearity), and wrapped the fit in a try/except so it won’t crash your pipeline. Here’s the complete, end-to-end script with that fix included:
-
-```python
 #!/usr/bin/env python3
 """
 Patient-Level Forecasting & Evaluation Pipeline (Serial, Full Version)
@@ -8,11 +5,11 @@ Patient-Level Forecasting & Evaluation Pipeline (Serial, Full Version)
 Features:
   - Baseline models: Naive & Mean
   - Time-series models: ETS, SARIMA
-  - Survival model: CoxPH on inter-order gaps with L2 penalization
+  - Survival model: Cox Proportional Hazards on inter-order gaps (with L2 penalizer)
   - Skip series with ≤2 orders in training
   - 12→12 backtesting
   - 12-event production forecasts
-  - Loads MODEL_EVAL & EVAL_DETAIL into Snowflake
+  - Loads results into Snowflake tables MODEL_EVAL & EVAL_DETAIL
 
 Assumes `my_df` loaded with:
   PATIENTID, ORDERNUMBER, HCPCS, SERVICEDATEOFORDER,
@@ -34,16 +31,19 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from snowflake.connector import connect
 from snowflake.connector.pandas_tools import write_pandas
 
-# --- Logging ---
+# --- Logging setup ---
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 # --- 0. Load your data into my_df ---
-# Replace with your loader:
+# Replace this placeholder with your actual data loading logic:
 # conn = connect(...)
-# my_df = pd.read_sql(..., conn)
+# my_df = pd.read_sql("SELECT PATIENTID, ORDERNUMBER, HCPCS, "
+#                     "SERVICEDATEOFORDER AS date, TOTALAMOUNT, "
+#                     "TOTALQTY AS units, SUPPLYDURATION, ELIGIBLETOSHIP "
+#                     "FROM YOUR_TABLE", conn)
 logger.info("Assuming `my_df` is loaded with required columns.")
 
 # --- 1. Preprocess ---
@@ -55,7 +55,7 @@ my_df['date']           = pd.to_datetime(my_df['date'])
 my_df['units']          = my_df['units'].astype(float)
 my_df['ELIGIBLETOSHIP'] = pd.to_datetime(my_df['ELIGIBLETOSHIP'])
 my_df['HCPCS']          = my_df['HCPCS'].astype(str)
-logger.info("Preprocessing complete.")
+logger.info("Preprocessing complete: cast dtypes and rename columns.")
 
 # --- 2. Fit global CoxPH on inter-order gaps ---
 gap_records = []
@@ -73,19 +73,17 @@ cph = None
 if gap_records:
     gap_df = pd.DataFrame(gap_records)
     gap_df = pd.get_dummies(gap_df, columns=['HCPCS'], drop_first=True)
-
     try:
-        # Add a small penalizer to avoid singularities from collinearity
         cph = CoxPHFitter(penalizer=0.1)
         cph.fit(gap_df, duration_col='duration', event_col='event', show_progress=False)
-        logger.info("CoxPH model fitted with L2 penalization.")
+        logger.info("CoxPH model fitted on gap data.")
     except ConvergenceError as e:
-        logger.warning("CoxPH failed to converge (collinearity?): %s; skipping CoxPH.", e)
+        logger.warning("CoxPH failed to converge (%s); skipping.", e)
         cph = None
 else:
     logger.warning("No gap records found; skipping CoxPH fit.")
 
-# --- 3. Forecasting helpers ---
+# --- 3. Forecasting helper functions ---
 def fit_naive(train, horizon):
     val = train.iloc[-1] if len(train) > 0 else np.nan
     return pd.Series(val, index=horizon)
@@ -111,27 +109,22 @@ def fit_sarima(train, horizon):
 
 # --- 4. Model selection function ---
 def select_best(pid, code, train, test, cph_model):
-    horizon = test.index
     preds = {
-        'Naive':  fit_naive(train, horizon),
-        'Mean':   fit_mean(train, horizon),
-        'ETS':    fit_ets(train, horizon),
-        'SARIMA': fit_sarima(train, horizon),
+        'Naive':  fit_naive(train, test.index),
+        'Mean':   fit_mean(train, test.index),
+        'ETS':    fit_ets(train, test.index),
+        'SARIMA': fit_sarima(train, test.index),
     }
     errors = {}
     if len(test) > 0:
         for name, p in preds.items():
             if len(p) == len(test):
                 errors[name] = mean_absolute_error(test, p)
-    # Add CoxPH if available and enough history
+    # CoxPH candidate
     if cph_model and (train > 0).sum() > 2:
-        last_date = train[train > 0].index.max()
-        last_sup  = my_df.loc[
-            (my_df.PATIENTID == pid) &
-            (my_df.HCPCS == code) &
-            (my_df.date == last_date),
-            'SUPPLYDURATION'
-        ].iloc[0]
+        # Always take last supply duration in the full series
+        full = my_df[(my_df.PATIENTID == pid) & (my_df.HCPCS == code)].sort_values('date')
+        last_sup = full['SUPPLYDURATION'].iloc[-1]
         cov_cols = list(cph_model.params_.index)
         cov_dict = {col: 0 for col in cov_cols}
         cov_dict['eligible_days'] = last_sup
@@ -166,16 +159,15 @@ for pid, code in keys:
     train = ts[start:train_end]
     test  = ts[test_start:test_end]
 
-    # skip series with too few orders
     if (train > 0).sum() <= 2:
-        best   = 'Mean'
-        pred   = fit_mean(train, test.index)
-        mae_val  = (np.nan if test.empty else mean_absolute_error(test, pred))
-        rmse_val = (np.nan if test.empty else mean_squared_error(test, pred)**0.5)
+        best = 'Mean'
+        pred = fit_mean(train, test.index)
+        mae_val  = np.nan if test.empty else mean_absolute_error(test, pred)
+        rmse_val = np.nan if test.empty else mean_squared_error(test, pred)**0.5
     else:
         best, pred = select_best(pid, code, train, test, cph)
-        mae_val  = (np.nan if (pred is None or test.empty) else mean_absolute_error(test, pred))
-        rmse_val = (np.nan if (pred is None or test.empty) else mean_squared_error(test, pred)**0.5)
+        mae_val  = np.nan if (pred is None or test.empty) else mean_absolute_error(test, pred)
+        rmse_val = np.nan if (pred is None or test.empty) else mean_squared_error(test, pred)**0.5
 
     eval_records.append({
         'PATIENTID':      pid,
@@ -186,7 +178,7 @@ for pid, code in keys:
     })
 
 eval_df = pd.DataFrame(eval_records)
-logger.info("Backtest complete: %d series.", len(eval_df))
+logger.info("Backtest complete: %d series evaluated.", len(eval_df))
 
 # --- 6. Production forecast (next 12 events) ---
 logger.info("Starting production forecast...")
@@ -208,7 +200,8 @@ for pid, code in keys:
     ].iloc[0]
 
     if best == 'CoxPH' and cph:
-        last_sup = grp.loc[grp.date == last_ship, 'SUPPLYDURATION'].iloc[0]
+        full = grp.sort_values('date')
+        last_sup = full['SUPPLYDURATION'].iloc[-1]
         cov_cols = list(cph.params_.index)
         cov_dict = {col: 0 for col in cov_cols}
         cov_dict['eligible_days'] = last_sup
@@ -254,14 +247,14 @@ logger.info("Forecast complete: %d events.", len(fc_df))
 act = my_df.sort_values(['PATIENTID','HCPCS','date']).copy()
 act['SERVICE_NUM'] = act.groupby(['PATIENTID','HCPCS']).cumcount() + 1
 act12 = act[act.SERVICE_NUM <= 12][['PATIENTID','HCPCS','SERVICE_NUM','date','ELIGIBLETOSHIP']]
-act12 = act12.rename(columns={'date': 'ACTUAL_DATE', 'ELIGIBLETOSHIP': 'ELIGIBLE_DATE'})
+act12 = act12.rename(columns={'date':'ACTUAL_DATE','ELIGIBLETOSHIP':'ELIGIBLE_DATE'})
 
 eval_detail = (
     fc_df.merge(act12, on=['PATIENTID','HCPCS','SERVICE_NUM'], how='left')
          .assign(
-             ERROR_DAYS=lambda df: (pd.to_datetime(df.PRED_DATE) - pd.to_datetime(df.ACTUAL_DATE)).dt.days,
-             DELAY_DAYS=lambda df: (pd.to_datetime(df.ACTUAL_DATE) - pd.to_datetime(df.ELIGIBLE_DATE)).dt.days,
-             SLACK_DAYS=lambda df: (pd.to_datetime(df.PRED_DATE) - pd.to_datetime(df.ELIGIBLE_DATE)).dt.days
+             ERROR_DAYS = lambda df: (pd.to_datetime(df.PRED_DATE) - pd.to_datetime(df.ACTUAL_DATE)).dt.days,
+             DELAY_DAYS = lambda df: (pd.to_datetime(df.ACTUAL_DATE) - pd.to_datetime(df.ELIGIBLE_DATE)).dt.days,
+             SLACK_DAYS = lambda df: (pd.to_datetime(df.PRED_DATE) - pd.to_datetime(df.ELIGIBLE_DATE)).dt.days
          )
 )
 logger.info("Detail evaluation built: %d rows.", len(eval_detail))
@@ -282,4 +275,3 @@ eval_detail['ELIGIBLE_DATE'] = pd.to_datetime(eval_detail['ELIGIBLE_DATE']).dt.d
 write_pandas(conn, eval_detail, 'EVAL_DETAIL', schema=os.getenv('SNOWFLAKE_SCHEMA'))
 conn.close()
 logger.info("Pipeline complete.")
-```
