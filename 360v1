@@ -1,0 +1,138 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import skew, kurtosis
+
+# assume my_df is already loaded, and dates are parsed
+# my_df = pd.read_csv(..., parse_dates=['ORDERSERVICEDATE','ELIGIBLESHIPDATE'])
+
+df = my_df.copy()
+df = df.sort_values(['CUSTOMERID','ORDERSERVICEDATE'])
+
+# --- basic derived columns ---
+df['DAYS_LATE'] = (df['ORDERSERVICEDATE'] - df['ELIGIBLESHIPDATE']).dt.days
+
+# previous-order/order interval
+df['PREV_ORD_DATE'] = df.groupby('CUSTOMERID')['ORDERSERVICEDATE'].shift()
+df['DAYS_BETWEEN'] = (df['ORDERSERVICEDATE'] - df['PREV_ORD_DATE']).dt.days
+
+# supply switches
+df['PREV_SUPPLY'] = df.groupby('CUSTOMERID')['SUPPLYDURATION'].shift()
+df['SUPPLY_SWITCH'] = (df['SUPPLYDURATION'] != df['PREV_SUPPLY']).astype(int)
+
+# --- aggregate per customer ---
+agg_funcs = {
+    'ORDERSERVICEDATE': ['count', 'min', 'max'],
+    'DAYS_LATE':    ['mean', 'std', 'min', 'max'],
+    'TOTALAMOUNT':  ['sum','mean','std'],
+    'TOTALQTY':     ['sum','mean','std'],
+    'DAYS_BETWEEN':['mean','std'],
+    'SUPPLYDURATION':['mean'],   # placeholder for mode below
+    'SUPPLY_SWITCH':'sum',
+}
+cust = df.groupby('CUSTOMERID').agg(agg_funcs)
+cust.columns = ['_'.join(col).upper() for col in cust.columns]
+
+# rename and compute a few more
+cust = cust.rename(columns={
+    'ORDERSERVICEDATE_COUNT':'TOTAL_ORDERS',
+    'ORDERSERVICEDATE_MIN':'FIRST_ORDER_DATE',
+    'ORDERSERVICEDATE_MAX':'LAST_ORDER_DATE',
+    'DAYS_BETWEEN_MEAN':'IBI_MEAN',
+    'DAYS_BETWEEN_STD':'IBI_STD',
+    'SUPPLY_SWITCH_SUM':'SUPPLY_SWITCHES'
+})
+cust['DAYS_SINCE_LAST'] = (pd.Timestamp.today().normalize() - cust['LAST_ORDER_DATE']).dt.days
+cust['CUSTOMER_TENURE_DAYS'] = (cust['LAST_ORDER_DATE'] - cust['FIRST_ORDER_DATE']).dt.days.replace(0,np.nan)
+cust['MONTHLY_ORDER_RATE'] = cust['TOTAL_ORDERS'] / (cust['CUSTOMER_TENURE_DAYS']/30).replace(0,np.nan)
+
+# mode of supply duration
+mode_supply = df.groupby('CUSTOMERID')['SUPPLYDURATION'].agg(lambda x: x.mode().iat[0] if not x.mode().empty else np.nan)
+cust['PREFERRED_SUPPLY_DURATION'] = mode_supply
+cust['LAST_SUPPLY_DURATION'] = df.groupby('CUSTOMERID')['SUPPLYDURATION'].last()
+
+# pct 30 vs 90 day
+pct_30 = (df['SUPPLYDURATION']==30).groupby(df['CUSTOMERID']).mean()
+pct_90 = (df['SUPPLYDURATION']==90).groupby(df['CUSTOMERID']).mean()
+cust['PCT_30_DAY_SUPPLY'] = pct_30
+cust['PCT_90_DAY_SUPPLY'] = pct_90
+
+# IBI skew/kurtosis
+ibi_stats = df.groupby('CUSTOMERID')['DAYS_BETWEEN'].agg(lambda x: pd.Series({'SKEW': skew(x.dropna()), 'KURTOSIS': kurtosis(x.dropna())}))
+cust['IBI_SKEW'] = ibi_stats.xs('SKEW', level=1, axis=1)
+cust['IBI_KURTOSIS'] = ibi_stats.xs('KURTOSIS', level=1, axis=1)
+
+# --- RFM ---
+cust['RECENCY']   = cust['DAYS_SINCE_LAST']
+cust['FREQUENCY'] = cust['TOTAL_ORDERS']
+cust['MONETARY']  = cust['TOTALAMOUNT_SUM']
+
+for col in ['RECENCY','FREQUENCY','MONETARY']:
+    cust[f'{col}_RANK'] = pd.qcut(
+        cust[col].rank(method='first'), 5,
+        labels=False, duplicates='drop'
+    ) + 1
+
+cust['RFM_SCORE'] = cust['RECENCY_RANK']*100 + cust['FREQUENCY_RANK']*10 + cust['MONETARY_RANK']
+
+# --- cohort & tenure ---
+cust['FIRST_ORDER_MONTH'] = cust['FIRST_ORDER_DATE'].dt.to_period('M')
+cust['TENURE_DAYS']       = (pd.Timestamp.today().normalize() - cust['FIRST_ORDER_DATE']).dt.days
+
+# --- on-time / late rates ---
+on_time     = (df['DAYS_LATE'] <= 0).groupby(df['CUSTOMERID']).mean()
+late_7d     = (df['DAYS_LATE'] > 7).groupby(df['CUSTOMERID']).mean()
+late_30d    = (df['DAYS_LATE'] > 30).groupby(df['CUSTOMERID']).mean()
+cust['PCT_ON_TIME'] = on_time
+cust['PCT_LATE_7D'] = late_7d
+cust['PCT_LATE_30D'] = late_30d
+
+# --- seasonality ---
+df['WEEKDAY'] = df['ORDERSERVICEDATE'].dt.day_name()
+wk = df.groupby(['CUSTOMERID','WEEKDAY']).size().unstack(fill_value=0)
+cust['FAV_WEEKDAY'] = wk.idxmax(axis=1)
+p = wk.div(wk.sum(axis=1), axis=0)
+cust['WEEKDAY_ENTROPY'] = -(p * np.log(p+1e-9)).sum(axis=1)
+
+# --- revenue trend slope (last 180 days) ---
+cutoff = pd.Timestamp.today() - pd.Timedelta(days=180)
+recent = df[df['ORDERSERVICEDATE'] >= cutoff]
+def slope(g):
+    if len(g)<2: return 0.0
+    x = (g['ORDERSERVICEDATE'] - g['ORDERSERVICEDATE'].min()).dt.days.values
+    y = g['TOTALAMOUNT'].values
+    return np.polyfit(x, y, 1)[0]
+rev_slope = recent.groupby('CUSTOMERID').apply(slope)
+cust['REVENUE_TREND_SLOPE'] = rev_slope
+
+# --- product‐loyalty (Herfindahl) ---
+hcpcs_counts = df.groupby(['CUSTOMERID','HCPCS']).size().unstack(fill_value=0)
+p2 = hcpcs_counts.div(hcpcs_counts.sum(axis=1), axis=0)
+cust['HCPCS_HERFINDAHL'] = (p2**2).sum(axis=1)
+
+# --- behavioral segment assignment ---
+def segment_row(r, cfg=None):
+    # you can parameterize thresholds in cfg or hardcode here
+    if r.TOTAL_ORDERS < 2:
+        return 'NEW'
+    if r.DAYS_SINCE_LAST > 90:
+        return 'DORMANT'
+    if r.DAYS_LATE_MEAN < 5 and r.DAYS_LATE_STD < 2:
+        return 'STABLE'
+    if r.DAYS_LATE_MEAN < 15:
+        return 'FLEXIBLE'
+    return 'SPORADIC'
+
+cust['CUSTOMER_SEGMENT'] = cust.apply(segment_row, axis=1)
+# you can also compute a simplistic confidence:
+cust['SEGMENT_CONFIDENCE'] = np.where(
+    cust['CUSTOMER_SEGMENT']=='NEW', 0.5,
+    np.where(cust['CUSTOMER_SEGMENT']=='DORMANT', 0.9, 0.7)
+)
+
+# --- final cleanup & export ---
+cust_features = cust.reset_index()
+print(cust_features.shape)
+# cust_features.head()
+
+# optionally save:
+# cust_features.to_csv('customer_360_features.csv', index=False)
