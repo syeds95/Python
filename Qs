@@ -1,0 +1,2 @@
+File "Cell [cell2]", line 78, in <module>
+    cph.fit(gap_df, duration_col='duration', event_col='event', show_progress=False)
