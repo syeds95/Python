@@ -1,3 +1,4 @@
+```python
 # hme_key_metrics.py
 # Full Patient-Level & Aggregate Behavior Analysis for HME Business
 # Writes outputs directly into Snowflake tables
@@ -52,8 +53,14 @@ descriptive = (
     .join(last_order, on="PATIENTID")
     .join(freq_amt, on="PATIENTID", how="left")
     .join(patient_attrs, on="PATIENTID", how="left")
-    .with_column("TENURE_DAYS", F.datediff(F.lit(today), F.col("FIRST_SERVICE_DATE")))
-    .with_column("RECENCY_DAYS", F.datediff(F.lit(today), F.col("LAST_SERVICE_DATE")))
+    .with_column(
+        "TENURE_DAYS",
+        F.datediff('day', F.lit(today), F.col("FIRST_SERVICE_DATE"))
+    )
+    .with_column(
+        "RECENCY_DAYS",
+        F.datediff('day', F.lit(today), F.col("LAST_SERVICE_DATE"))
+    )
     .na.fill({"ORDERS_TOTAL": 0, "TOTAL_REVENUE": 0, "TOTAL_QTY": 0})
 )
 
@@ -68,16 +75,19 @@ intervals = (
     .with_column("PREV_SERVICE_DATE", F.lag("SERVICEDATEOFORDER").over(lag_window))
     .with_column(
         "DAYS_BETWEEN_ORDERS",
-        F.datediff(F.col("SERVICEDATEOFORDER"), F.col("PREV_SERVICE_DATE"))
+        F.datediff('day', F.col("SERVICEDATEOFORDER"), F.col("PREV_SERVICE_DATE"))
     )
     .filter(F.col("PREV_SERVICE_DATE").is_not_null())
     .with_column(
         "DAYS_FROM_ELIGIBLE",
-        F.datediff(F.col("SERVICEDATEOFORDER"), F.col("ELIGIBLETOSHIP"))
+        F.datediff('day', F.col("SERVICEDATEOFORDER"), F.col("ELIGIBLETOSHIP"))
     )
     .with_column(
         "ON_TIME_FLAG",
-        F.when(F.col("DAYS_FROM_ELIGIBLE") <= (F.col("SUPPLYDURATION") * 0.1), 1).otherwise(0)
+        F.when(
+            F.col("DAYS_FROM_ELIGIBLE") <= (F.col("SUPPLYDURATION") * 0.1),
+            1
+        ).otherwise(0)
     )
 )
 
@@ -95,7 +105,10 @@ df_patient_metrics = (
         on="PATIENTID",
         how="left"
     )
-    .with_column("ON_TIME_RATE", F.col("ON_TIME_ORDERS") / F.col("TOTAL_ORDERS"))
+    .with_column(
+        "ON_TIME_RATE",
+        F.col("ON_TIME_ORDERS") / F.col("TOTAL_ORDERS")
+    )
     .select(
         "PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP",
         "TENURE_DAYS", "RECENCY_DAYS", "ORDERS_TOTAL", "TOTAL_REVENUE", "TOTAL_QTY",
@@ -130,3 +143,4 @@ df_rollup.write.save_as_table(
 
 # 9. Close session
 session.close()
+```
