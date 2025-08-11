@@ -1,7 +1,7 @@
 ```python
 # hme_key_metrics.py
 # Full Patient-Level & Aggregate Behavior Analysis for HME Business
-# Updated with new schema and calculation of lag between orders and previous service date
+# Updated to write outputs directly into Snowflake tables
 
 from snowflake.snowpark import Session, functions as F, Window
 from datetime import date, timedelta
@@ -19,8 +19,9 @@ conn_params = {
 }
 session = Session.builder.configs(conn_params).create()
 
-# 2. Load orders table (new column names)
-orders = session.table("ORDERS")
+# 2. Load source data from your DataFrame (my_df)
+#    Ensure my_df is a Snowpark DataFrame with the same schema
+orders = my_df
 
 # 3. Reference dates
 today = date.today()
@@ -30,71 +31,57 @@ one_year_ago = today - timedelta(days=365)
 recent = orders.filter(F.col("SERVICEDATEOFORDER") >= F.to_date(F.lit(one_year_ago)))
 
 # 5. Compute descriptive patient attributes
-# 5a. First and last service date
 first_order = orders.group_by("PATIENTID").agg(
     F.min("SERVICEDATEOFORDER").alias("FIRST_SERVICE_DATE")
 )
 last_order = orders.group_by("PATIENTID").agg(
     F.max("SERVICEDATEOFORDER").alias("LAST_SERVICE_DATE")
 )
-# 5b. Frequency and monetary in past year
 freq_amt = recent.group_by("PATIENTID").agg(
     F.count("ORDERNUMBER").alias("ORDERS_LAST_12M"),
     F.sum("TOTALAMOUNT").alias("YTD_REVENUE"),
     F.sum("TOTALQTY").alias("YTD_QTY")
 )
-# 5c. Patient static attributes (most recent)
 attr_window = Window.partition_by("PATIENTID").order_by(F.col("SERVICEDATEOFORDER").desc())
 patient_attrs = (
-    orders
-    .with_column("rn", F.row_number().over(attr_window))
-    .filter(F.col("rn") == 1)
-    .select("PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP")
+    orders.with_column("rn", F.row_number().over(attr_window))
+          .filter(F.col("rn") == 1)
+          .select("PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP")
 )
 
-# 5d. Combine descriptive
 descriptive = (
-    first_order
-    .join(last_order, on="PATIENTID")
-    .join(freq_amt, on="PATIENTID", how="left")
-    .join(patient_attrs, on="PATIENTID", how="left")
-    .with_column("TENURE_DAYS", F.datediff(F.lit(today), F.col("FIRST_SERVICE_DATE")))
-    .with_column("RECENCY_DAYS", F.datediff(F.lit(today), F.col("LAST_SERVICE_DATE")))
-    .na.fill({"ORDERS_LAST_12M":0, "YTD_REVENUE":0, "YTD_QTY":0})
+    first_order.join(last_order, on="PATIENTID")
+               .join(freq_amt, on="PATIENTID", how="left")
+               .join(patient_attrs, on="PATIENTID", how="left")
+               .with_column("TENURE_DAYS", F.datediff(F.lit(today), F.col("FIRST_SERVICE_DATE")))
+               .with_column("RECENCY_DAYS", F.datediff(F.lit(today), F.col("LAST_SERVICE_DATE")))
+               .na.fill({"ORDERS_LAST_12M":0, "YTD_REVENUE":0, "YTD_QTY":0})
 )
 
 # 6. Compute inter-order lag and on-time metrics
 lag_window = Window.partition_by("PATIENTID").order_by("SERVICEDATEOFORDER")
 intervals = (
-    orders
-    .select(
+    orders.select(
         "PATIENTID", "ORDERNUMBER", "HCPCS", "SERVICEDATEOFORDER",
         "ELIGIBLETOSHIP", "SUPPLYDURATION", "TOTALAMOUNT"
     )
     .with_column("PREV_SERVICE_DATE", F.lag("SERVICEDATEOFORDER").over(lag_window))
     .with_column("DAYS_BETWEEN_ORDERS", F.datediff(F.col("SERVICEDATEOFORDER"), F.col("PREV_SERVICE_DATE")))
     .filter(F.col("PREV_SERVICE_DATE").is_not_null())
-    .with_column(
-        "DAYS_FROM_ELIGIBLE", F.datediff(F.col("SERVICEDATEOFORDER"), F.col("ELIGIBLETOSHIP"))
-    )
-    .with_column(
-        "ON_TIME_FLAG", F.when(F.col("DAYS_FROM_ELIGIBLE") <= (F.col("SUPPLYDURATION") * 0.1), 1).otherwise(0)
-    )
+    .with_column("DAYS_FROM_ELIGIBLE", F.datediff(F.col("SERVICEDATEOFORDER"), F.col("ELIGIBLETOSHIP")))
+    .with_column("ON_TIME_FLAG", F.when(F.col("DAYS_FROM_ELIGIBLE") <= (F.col("SUPPLYDURATION") * 0.1), 1).otherwise(0))
 )
 
 # 7. Patient-level Aggregations
-patient_metrics = (
-    descriptive
-    .join(
+df_patient_metrics = (
+    descriptive.join(
         intervals.group_by("PATIENTID").agg(
             F.avg("DAYS_BETWEEN_ORDERS").alias("AVG_DAYS_BETWEEN"),
             F.avg("DAYS_FROM_ELIGIBLE").alias("AVG_DAYS_LATE"),
             F.sum("ON_TIME_FLAG").alias("ON_TIME_ORDERS"),
             F.count("ORDERNUMBER").alias("TOTAL_ORDERS"),
             F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE")
-        ),
-        on="PATIENTID",
-        how="left"
+        ), on="PATIENTID", how="left"
     )
     .with_column("ON_TIME_RATE", F.col("ON_TIME_ORDERS") / F.col("TOTAL_ORDERS"))
     .select(
@@ -105,8 +92,8 @@ patient_metrics = (
 )
 
 # 8. Roll-up Summary with distribution metrics
-rollup = (
-    patient_metrics.agg(
+df_rollup = (
+    df_patient_metrics.agg(
         F.avg("TENURE_DAYS").alias("AVG_TENURE_DAYS"),
         F.avg("RECENCY_DAYS").alias("AVG_RECENCY_DAYS"),
         F.avg("ORDERS_LAST_12M").alias("AVG_FREQ_PER_PATIENT"),
@@ -121,12 +108,17 @@ rollup = (
     )
 )
 
-# 9. Display Patient-Level and Roll-up Metrics
-print("=== Patient-Level Behavior Metrics ===")
-print(patient_metrics.order_by(F.col("YTD_REVENUE").desc()).limit(10).to_pandas())
-
-print("\n=== Aggregate Roll-up Metrics with Distribution ===")
-print(rollup.to_pandas())
+# 9. Write results to Snowflake tables (auto-create or overwrite)
+df_patient_metrics.write.save_as_table(
+    name="PATIENT_BEHAVIOR_METRICS",
+    mode="overwrite",
+    table_type="TABLE"
+)
+df_rollup.write.save_as_table(
+    name="PATIENT_METRICS_ROLLUP",
+    mode="overwrite",
+    table_type="TABLE"
+)
 
 # 10. Close session
 session.close()
