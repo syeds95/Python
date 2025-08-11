@@ -21,16 +21,18 @@ session = Session.builder.configs(conn_params).create()
 
 # 2. Load source data from your DataFrame (my_df)
 #    Ensure my_df is a Snowpark DataFrame with the same schema
-orders = my_df
+# Ensure my_df is a Snowpark DataFrame; if it's a pandas DataFrame, convert it
+from snowflake.snowpark import DataFrame as SnowparkDataFrame
+if not isinstance(my_df, SnowparkDataFrame):
+    orders = session.create_dataframe(my_df)
+else:
+    orders = my_df
 
-# 3. Reference dates
+# 3. Reference dates (not filtering by timeframe, using full dataset)
+#    No time-based filter applied; analyzing entire order history
 today = date.today()
-one_year_ago = today - timedelta(days=365)
 
-# 4. Filter last 12 months based on service date
-recent = orders.filter(F.col("SERVICEDATEOFORDER") >= F.to_date(F.lit(one_year_ago)))
-
-# 5. Compute descriptive patient attributes
+# 5. Compute descriptive patient attributes Compute descriptive patient attributes
 first_order = orders.group_by("PATIENTID").agg(
     F.min("SERVICEDATEOFORDER").alias("FIRST_SERVICE_DATE")
 )
