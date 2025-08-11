@@ -1,7 +1,7 @@
 ```python
 # hme_key_metrics.py
 # Full Patient-Level & Aggregate Behavior Analysis for HME Business
-# Writes outputs directly into Snowflake tables
+# Writes outputs directly into pre-created Snowflake tables
 
 from snowflake.snowpark import Session, Window, DataFrame as SnowparkDataFrame
 from snowflake.snowpark import functions as F
@@ -20,8 +20,7 @@ tmp = {
 }
 session = Session.builder.configs(tmp).create()
 
-# 2. Load source data from your DataFrame (my_df)
-#    Ensure my_df is a Snowpark DataFrame; if it's a pandas DataFrame, convert it
+# 2. Load source data from your Snowpark DataFrame (my_df)
 if not isinstance(my_df, SnowparkDataFrame):
     orders = session.create_dataframe(my_df)
 else:
@@ -44,9 +43,10 @@ freq_amt = orders.group_by("PATIENTID").agg(
 )
 attr_window = Window.partition_by("PATIENTID").order_by(F.col("SERVICEDATEOFORDER").desc())
 patient_attrs = (
-    orders.with_column("rn", F.row_number().over(attr_window))
-          .filter(F.col("rn") == 1)
-          .select("PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP")
+    orders
+    .with_column("rn", F.row_number().over(attr_window))
+    .filter(F.col("rn") == 1)
+    .select("PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP")
 )
 descriptive = (
     first_order
@@ -55,11 +55,11 @@ descriptive = (
     .join(patient_attrs, on="PATIENTID", how="left")
     .with_column(
         "TENURE_DAYS",
-        F.datediff('day', F.lit(today), F.col("FIRST_SERVICE_DATE"))
+        F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.lit(today))
     )
     .with_column(
         "RECENCY_DAYS",
-        F.datediff('day', F.lit(today), F.col("LAST_SERVICE_DATE"))
+        F.datediff('day', F.col("LAST_SERVICE_DATE"),  F.lit(today))
     )
     .na.fill({"ORDERS_TOTAL": 0, "TOTAL_REVENUE": 0, "TOTAL_QTY": 0})
 )
@@ -75,12 +75,12 @@ intervals = (
     .with_column("PREV_SERVICE_DATE", F.lag("SERVICEDATEOFORDER").over(lag_window))
     .with_column(
         "DAYS_BETWEEN_ORDERS",
-        F.datediff('day', F.col("SERVICEDATEOFORDER"), F.col("PREV_SERVICE_DATE"))
+        F.datediff('day', F.col("PREV_SERVICE_DATE"), F.col("SERVICEDATEOFORDER"))
     )
     .filter(F.col("PREV_SERVICE_DATE").is_not_null())
     .with_column(
         "DAYS_FROM_ELIGIBLE",
-        F.datediff('day', F.col("SERVICEDATEOFORDER"), F.col("ELIGIBLETOSHIP"))
+        F.datediff('day', F.col("ELIGIBLETOSHIP"), F.col("SERVICEDATEOFORDER"))
     )
     .with_column(
         "ON_TIME_FLAG",
@@ -93,17 +93,14 @@ intervals = (
 
 # 6. Patient-level Aggregations
 df_patient_metrics = (
-    descriptive
-    .join(
+    descriptive.join(
         intervals.group_by("PATIENTID").agg(
             F.avg("DAYS_BETWEEN_ORDERS").alias("AVG_DAYS_BETWEEN"),
             F.avg("DAYS_FROM_ELIGIBLE").alias("AVG_DAYS_LATE"),
             F.sum("ON_TIME_FLAG").alias("ON_TIME_ORDERS"),
             F.count("ORDERNUMBER").alias("TOTAL_ORDERS"),
             F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE_ORDERS")
-        ),
-        on="PATIENTID",
-        how="left"
+        ), on="PATIENTID", how="left"
     )
     .with_column(
         "ON_TIME_RATE",
@@ -134,55 +131,11 @@ df_rollup = (
 )
 
 # 8. Write results to Snowflake tables (auto-create or overwrite)
-df_patient_metrics.write.save_as_table(
-    name="PATIENT_BEHAVIOR_METRICS", mode="overwrite"
-)
-df_rollup.write.save_as_table(
-    name="PATIENT_METRICS_ROLLUP", mode="overwrite"
-)
+#    Use positional table_name argument
+#    Replace with your fully qualified table if needed: "DB.SCHEMA.TABLE"
+df_patient_metrics.write.save_as_table("PATIENT_BEHAVIOR_METRICS", mode="overwrite")
+df_rollup.write.save_as_table("PATIENT_METRICS_ROLLUP", mode="overwrite")
 
 # 9. Close session
 session.close()
 ```
-
-
-
-
-
--- SQL DDL to create empty base tables for metrics and rollup
-
--- 1. Create an empty PATIENT_BEHAVIOR_METRICS table to load patient-level metrics into
-CREATE OR REPLACE TABLE PATIENT_BEHAVIOR_METRICS (
-  PATIENTID STRING,
-  INSURANCE STRING,
-  PATIENT_GROUP STRING,
-  ITEM_GROUP STRING,
-  TENURE_DAYS INTEGER,
-  RECENCY_DAYS INTEGER,
-  ORDERS_TOTAL INTEGER,
-  TOTAL_REVENUE DECIMAL(18,2),
-  TOTAL_QTY DECIMAL(18,2),
-  AVG_DAYS_BETWEEN DOUBLE,
-  AVG_DAYS_LATE DOUBLE,
-  ON_TIME_ORDERS INTEGER,
-  TOTAL_ORDERS INTEGER,
-  TOTAL_REVENUE_ORDERS DECIMAL(18,2),
-  ON_TIME_RATE DOUBLE
-);
-
--- 2. Create an empty PATIENT_METRICS_ROLLUP table to load aggregate metrics into
-CREATE OR REPLACE TABLE PATIENT_METRICS_ROLLUP (
-  AVG_TENURE_DAYS       DOUBLE,
-  AVG_RECENCY_DAYS      DOUBLE,
-  AVG_FREQ_PER_PATIENT  DOUBLE,
-  AVG_REV_PER_PATIENT   DOUBLE,
-  AVG_DAYS_BETWEEN_ORDERS DOUBLE,
-  AVG_DAYS_LATE         DOUBLE,
-  AVG_ON_TIME_RATE      DOUBLE,
-  MEDIAN_DAYS_BETWEEN   DOUBLE,
-  MEDIAN_ON_TIME_RATE   DOUBLE,
-  PCT25_DAYS_LATE       DOUBLE,
-  PCT75_DAYS_LATE       DOUBLE
-);
-
--- After running this DDL, you can point your Python script to write into these tables using save_as_table or equivalent.
