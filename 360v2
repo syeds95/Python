@@ -1,14 +1,14 @@
-```python
 # hme_key_metrics.py
 # Full Patient-Level & Aggregate Behavior Analysis for HME Business
-# Updated to write outputs directly into Snowflake tables
+# Writes outputs directly into Snowflake tables
 
-from snowflake.snowpark import Session, functions as F, Window
-from datetime import date, timedelta
+from snowflake.snowpark import Session, Window, DataFrame as SnowparkDataFrame
+from snowflake.snowpark import functions as F
+from datetime import date
 import os
 
 # 1. Connect to Snowflake
-conn_params = {
+tmp = {
     'account': os.getenv('SNOWFLAKE_ACCOUNT'),
     'user': os.getenv('SNOWFLAKE_USER'),
     'password': os.getenv('SNOWFLAKE_PASSWORD'),
@@ -17,32 +17,29 @@ conn_params = {
     'database': os.getenv('SNOWFLAKE_DATABASE'),
     'schema': os.getenv('SNOWFLAKE_SCHEMA')
 }
-session = Session.builder.configs(conn_params).create()
+session = Session.builder.configs(tmp).create()
 
 # 2. Load source data from your DataFrame (my_df)
-#    Ensure my_df is a Snowpark DataFrame with the same schema
-# Ensure my_df is a Snowpark DataFrame; if it's a pandas DataFrame, convert it
-from snowflake.snowpark import DataFrame as SnowparkDataFrame
+#    Ensure my_df is a Snowpark DataFrame; if it's a pandas DataFrame, convert it
 if not isinstance(my_df, SnowparkDataFrame):
     orders = session.create_dataframe(my_df)
 else:
     orders = my_df
 
-# 3. Reference dates (not filtering by timeframe, using full dataset)
-#    No time-based filter applied; analyzing entire order history
+# 3. Reference date for recency and tenure calculations
 today = date.today()
 
-# 5. Compute descriptive patient attributes Compute descriptive patient attributes
+# 4. Compute descriptive patient attributes
 first_order = orders.group_by("PATIENTID").agg(
     F.min("SERVICEDATEOFORDER").alias("FIRST_SERVICE_DATE")
 )
 last_order = orders.group_by("PATIENTID").agg(
     F.max("SERVICEDATEOFORDER").alias("LAST_SERVICE_DATE")
 )
-freq_amt = recent.group_by("PATIENTID").agg(
-    F.count("ORDERNUMBER").alias("ORDERS_LAST_12M"),
-    F.sum("TOTALAMOUNT").alias("YTD_REVENUE"),
-    F.sum("TOTALQTY").alias("YTD_QTY")
+freq_amt = orders.group_by("PATIENTID").agg(
+    F.count("ORDERNUMBER").alias("ORDERS_TOTAL"),
+    F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE"),
+    F.sum("TOTALQTY").alias("TOTAL_QTY")
 )
 attr_window = Window.partition_by("PATIENTID").order_by(F.col("SERVICEDATEOFORDER").desc())
 patient_attrs = (
@@ -50,56 +47,69 @@ patient_attrs = (
           .filter(F.col("rn") == 1)
           .select("PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP")
 )
-
 descriptive = (
-    first_order.join(last_order, on="PATIENTID")
-               .join(freq_amt, on="PATIENTID", how="left")
-               .join(patient_attrs, on="PATIENTID", how="left")
-               .with_column("TENURE_DAYS", F.datediff(F.lit(today), F.col("FIRST_SERVICE_DATE")))
-               .with_column("RECENCY_DAYS", F.datediff(F.lit(today), F.col("LAST_SERVICE_DATE")))
-               .na.fill({"ORDERS_LAST_12M":0, "YTD_REVENUE":0, "YTD_QTY":0})
+    first_order
+    .join(last_order, on="PATIENTID")
+    .join(freq_amt, on="PATIENTID", how="left")
+    .join(patient_attrs, on="PATIENTID", how="left")
+    .with_column("TENURE_DAYS", F.datediff(F.lit(today), F.col("FIRST_SERVICE_DATE")))
+    .with_column("RECENCY_DAYS", F.datediff(F.lit(today), F.col("LAST_SERVICE_DATE")))
+    .na.fill({"ORDERS_TOTAL": 0, "TOTAL_REVENUE": 0, "TOTAL_QTY": 0})
 )
 
-# 6. Compute inter-order lag and on-time metrics
+# 5. Compute inter-order lag and on-time metrics
 lag_window = Window.partition_by("PATIENTID").order_by("SERVICEDATEOFORDER")
 intervals = (
-    orders.select(
+    orders
+    .select(
         "PATIENTID", "ORDERNUMBER", "HCPCS", "SERVICEDATEOFORDER",
         "ELIGIBLETOSHIP", "SUPPLYDURATION", "TOTALAMOUNT"
     )
     .with_column("PREV_SERVICE_DATE", F.lag("SERVICEDATEOFORDER").over(lag_window))
-    .with_column("DAYS_BETWEEN_ORDERS", F.datediff(F.col("SERVICEDATEOFORDER"), F.col("PREV_SERVICE_DATE")))
+    .with_column(
+        "DAYS_BETWEEN_ORDERS",
+        F.datediff(F.col("SERVICEDATEOFORDER"), F.col("PREV_SERVICE_DATE"))
+    )
     .filter(F.col("PREV_SERVICE_DATE").is_not_null())
-    .with_column("DAYS_FROM_ELIGIBLE", F.datediff(F.col("SERVICEDATEOFORDER"), F.col("ELIGIBLETOSHIP")))
-    .with_column("ON_TIME_FLAG", F.when(F.col("DAYS_FROM_ELIGIBLE") <= (F.col("SUPPLYDURATION") * 0.1), 1).otherwise(0))
+    .with_column(
+        "DAYS_FROM_ELIGIBLE",
+        F.datediff(F.col("SERVICEDATEOFORDER"), F.col("ELIGIBLETOSHIP"))
+    )
+    .with_column(
+        "ON_TIME_FLAG",
+        F.when(F.col("DAYS_FROM_ELIGIBLE") <= (F.col("SUPPLYDURATION") * 0.1), 1).otherwise(0)
+    )
 )
 
-# 7. Patient-level Aggregations
+# 6. Patient-level Aggregations
 df_patient_metrics = (
-    descriptive.join(
+    descriptive
+    .join(
         intervals.group_by("PATIENTID").agg(
             F.avg("DAYS_BETWEEN_ORDERS").alias("AVG_DAYS_BETWEEN"),
             F.avg("DAYS_FROM_ELIGIBLE").alias("AVG_DAYS_LATE"),
             F.sum("ON_TIME_FLAG").alias("ON_TIME_ORDERS"),
             F.count("ORDERNUMBER").alias("TOTAL_ORDERS"),
-            F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE")
-        ), on="PATIENTID", how="left"
+            F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE_ORDERS")
+        ),
+        on="PATIENTID",
+        how="left"
     )
     .with_column("ON_TIME_RATE", F.col("ON_TIME_ORDERS") / F.col("TOTAL_ORDERS"))
     .select(
         "PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP",
-        "TENURE_DAYS", "RECENCY_DAYS", "ORDERS_LAST_12M", "YTD_REVENUE", "YTD_QTY",
+        "TENURE_DAYS", "RECENCY_DAYS", "ORDERS_TOTAL", "TOTAL_REVENUE", "TOTAL_QTY",
         "AVG_DAYS_BETWEEN", "AVG_DAYS_LATE", "ON_TIME_RATE"
     )
 )
 
-# 8. Roll-up Summary with distribution metrics
+# 7. Roll-up Summary with distribution metrics
 df_rollup = (
     df_patient_metrics.agg(
         F.avg("TENURE_DAYS").alias("AVG_TENURE_DAYS"),
         F.avg("RECENCY_DAYS").alias("AVG_RECENCY_DAYS"),
-        F.avg("ORDERS_LAST_12M").alias("AVG_FREQ_PER_PATIENT"),
-        F.avg("YTD_REVENUE").alias("AVG_REV_PER_PATIENT"),
+        F.avg("ORDERS_TOTAL").alias("AVG_FREQ_PER_PATIENT"),
+        F.avg("TOTAL_REVENUE").alias("AVG_REV_PER_PATIENT"),
         F.avg("AVG_DAYS_BETWEEN").alias("AVG_DAYS_BETWEEN_ORDERS"),
         F.avg("AVG_DAYS_LATE").alias("AVG_DAYS_LATE"),
         F.avg("ON_TIME_RATE").alias("AVG_ON_TIME_RATE"),
@@ -110,18 +120,13 @@ df_rollup = (
     )
 )
 
-# 9. Write results to Snowflake tables (auto-create or overwrite)
+# 8. Write results to Snowflake tables (auto-create or overwrite)
 df_patient_metrics.write.save_as_table(
-    name="PATIENT_BEHAVIOR_METRICS",
-    mode="overwrite",
-    table_type="TABLE"
+    name="PATIENT_BEHAVIOR_METRICS", mode="overwrite"
 )
 df_rollup.write.save_as_table(
-    name="PATIENT_METRICS_ROLLUP",
-    mode="overwrite",
-    table_type="TABLE"
+    name="PATIENT_METRICS_ROLLUP", mode="overwrite"
 )
 
-# 10. Close session
+# 9. Close session
 session.close()
-```
