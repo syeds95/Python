@@ -1,18 +1,7 @@
-CREATE OR REPLACE TABLE MONTHLY_BEHAVIOR_TRENDS (
-  MONTH DATE,
-  ACTIVE_PATIENTS INTEGER,
-  TOTAL_ORDERS INTEGER,
-  AVG_DAYS_LATE DOUBLE,
-  ON_TIME_RATE DOUBLE,
-  TOTAL_REVENUE DECIMAL(18,2)
-);
-
-
 ```python
 # hme_key_metrics.py
 # Complete Patient-Level & Aggregate Behavior Analysis for HME Business
-# Includes RFM, churn, reactivation, time-to-first-reorder, LTV curves, basket composition,
-# seasonality, lateness bucketing, group rollups, and monthly trend analysis.
+# Revised to correctly reference descriptive fields and compute all metrics
 
 from snowflake.snowpark import Session, Window, DataFrame as SnowparkDataFrame
 from snowflake.snowpark import functions as F
@@ -20,27 +9,30 @@ from datetime import date, timedelta
 import os
 
 # 1. Connect to Snowflake
-conn_params = {
-    'account': os.getenv('SNOWFLAKE_ACCOUNT'),
-    'user': os.getenv('SNOWFLAKE_USER'),
-    'password': os.getenv('SNOWFLAKE_PASSWORD'),
-    'role': os.getenv('SNOWFLAKE_ROLE', 'PUBLIC'),
-    'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
-    'database': os.getenv('SNOWFLAKE_DATABASE'),
-    'schema': os.getenv('SNOWFLAKE_SCHEMA')
-}
-session = Session.builder.configs(conn_params).create()
+def create_session():
+    conn_params = {
+        'account': os.getenv('SNOWFLAKE_ACCOUNT'),
+        'user': os.getenv('SNOWFLAKE_USER'),
+        'password': os.getenv('SNOWFLAKE_PASSWORD'),
+        'role': os.getenv('SNOWFLAKE_ROLE', 'PUBLIC'),
+        'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
+        'database': os.getenv('SNOWFLAKE_DATABASE'),
+        'schema': os.getenv('SNOWFLAKE_SCHEMA')
+    }
+    return Session.builder.configs(conn_params).create()
 
-# 2. Load input DataFrame (my_df must be a Snowpark DataFrame)
+session = create_session()
+
+# 2. Load the source DataFrame
 if not isinstance(my_df, SnowparkDataFrame):
     orders = session.create_dataframe(my_df)
 else:
     orders = my_df
 
-# 3. Reference date for tenure/recency calculations
+# 3. Reference date
 today = date.today()
 
-# 4. Descriptive patient attributes (RFM + tenure)
+# 4. Build descriptive table: RFM + tenure + static attrs
 win_desc = Window.partition_by("PATIENTID").order_by(F.col("SERVICEDATEOFORDER").desc())
 descriptive = (
     orders
@@ -61,12 +53,14 @@ descriptive = (
     .with_column("RECENCY_DAYS", F.datediff('day', F.col("LAST_SERVICE_DATE"), F.lit(today)))
 )
 
-# 5. Order-level lag & on-time metrics
+# 5. Deduplicate orders to one row per order
 orders_dedup = (
     orders
     .select("PATIENTID", "ORDERNUMBER", "SERVICEDATEOFORDER", "ELIGIBLETOSHIP", "SUPPLYDURATION", "TOTALAMOUNT")
     .distinct()
 )
+
+# 6. Compute order-level lag and on-time flags
 win_ord = Window.partition_by("PATIENTID").order_by("SERVICEDATEOFORDER")
 order_intervals = (
     orders_dedup
@@ -75,11 +69,10 @@ order_intervals = (
     .filter(F.col("PREV_DATE").is_not_null())
     .with_column("DAYS_BETWEEN", F.datediff('day', F.col("PREV_DATE"), F.col("SERVICEDATEOFORDER")))
     .with_column("DAYS_AFTER_ELIGIBLE", F.datediff('day', F.col("PREV_ELIGIBLE"), F.col("SERVICEDATEOFORDER")))
-    .with_column(
-        "ON_TIME_FLAG",
+    .with_column("ON_TIME_FLAG",
         F.when(
             (F.col("DAYS_AFTER_ELIGIBLE") >= 0) &
-            (F.col("DAYS_AFTER_ELIGIBLE") <= (F.col("SUPPLYDURATION") * 0.1)),
+            (F.col("DAYS_AFTER_ELIGIBLE") <= F.col("SUPPLYDURATION") * 0.1),
             1
         ).otherwise(0)
     )
@@ -95,18 +88,17 @@ order_metrics = (
     )
 )
 
-# 6. Additional patient behaviors
-# 6a. Churn flag: if last recency > 1.1 * last supply duration
+# 7. Churn flag based on last supply duration
 last_supply = orders_dedup.group_by("PATIENTID").agg(F.max("SUPPLYDURATION").alias("LAST_SUPPLY_DURATION"))
 churn = (
     descriptive
     .join(last_supply, on="PATIENTID")
-    .with_column(
-        "CHURN_FLAG",
+    .with_column("CHURN_FLAG",
         F.when(F.col("RECENCY_DAYS") > F.col("LAST_SUPPLY_DURATION") * 1.1, 1).otherwise(0)
     )
 )
-# 6b. Time to first reorder
+
+# 8. Time to first reorder (days)
 second_order = (
     orders_dedup
     .with_column("rn", F.row_number().over(win_ord))
@@ -118,34 +110,45 @@ time_to_first = (
     .join(second_order, on="PATIENTID", how="left")
     .with_column("TIME_TO_FIRST_REORDER", F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.col("SECOND_DATE")))
 )
-# 6c. LTV curves: cumulative revenue at set day thresholds
+
+# 9. Join FIRST_SERVICE_DATE into orders for LTV calculation
+orders_with_first = orders.join(descriptive.select("PATIENTID","FIRST_SERVICE_DATE"), on="PATIENTID")
+
+# 10. LTV curves at 30/60/90/180/365 days
 ltv_thresholds = [30, 60, 90, 180, 365]
-ltv = orders
-ltv = ltv.select(
-    "PATIENTID",
-    *[F.sum(
-         F.when(
-             F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.col("SERVICEDATEOFORDER")) <= d,
-             F.col("TOTALAMOUNT")
-          ).otherwise(0)
-       ).alias(f"LTV_{d}d") for d in ltv_thresholds]
-).group_by("PATIENTID").agg(*[F.max(col).alias(col) for col in [f"LTV_{d}d" for d in ltv_thresholds]])
-# 6d. Basket composition: unique HCPCS count
+ltv = (
+    orders_with_first
+    .select(
+        "PATIENTID",
+        *[
+            F.sum(
+                F.when(
+                    F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.col("SERVICEDATEOFORDER")) <= d,
+                    F.col("TOTALAMOUNT")
+                ).otherwise(0)
+            ).alias(f"LTV_{d}d")
+            for d in ltv_thresholds
+        ]
+    )
+    .group_by("PATIENTID").agg(*[F.max(f"LTV_{d}d").alias(f"LTV_{d}d") for d in ltv_thresholds])
+)
+
+# 11. Basket composition: unique HCPCS count
 distinct_items = orders.group_by("PATIENTID").agg(F.count_distinct("HCPCS").alias("UNIQUE_HCPCS"))
-# 6e. Seasonality: count distinct active months
+
+# 12. Seasonality: distinct active months
 distinct_months = (
     orders
     .with_column("MONTH", F.date_trunc("month", F.col("SERVICEDATEOFORDER")))
-    .group_by("PATIENTID")
-    .agg(F.count_distinct("MONTH").alias("ACTIVE_MONTHS"))
+    .group_by("PATIENTID").agg(F.count_distinct("MONTH").alias("ACTIVE_MONTHS"))
 )
 
-# 7. Assemble full patient-level dataset
+# 13. Assemble full patient-level table
 df_patient = (
     descriptive
     .join(order_metrics, on="PATIENTID", how="left")
-    .join(churn.select("PATIENTID", "CHURN_FLAG"), on="PATIENTID", how="left")
-    .join(time_to_first.select("PATIENTID", "TIME_TO_FIRST_REORDER"), on="PATIENTID", how="left")
+    .join(churn.select("PATIENTID","CHURN_FLAG"), on="PATIENTID", how="left")
+    .join(time_to_first.select("PATIENTID","TIME_TO_FIRST_REORDER"), on="PATIENTID", how="left")
     .join(ltv, on="PATIENTID", how="left")
     .join(distinct_items, on="PATIENTID", how="left")
     .join(distinct_months, on="PATIENTID", how="left")
@@ -162,12 +165,12 @@ df_patient = (
     )
 )
 
-# 8. Persist patient-level metrics
+# 14. Persist patient-level metrics
 session.sql("TRUNCATE TABLE PATIENT_BEHAVIOR_METRICS").collect()
 df_patient.write.save_as_table("PATIENT_BEHAVIOR_METRICS", mode="overwrite")
 
-# 9. Group-level rollups
-groupings = ["PATIENT_GROUP", "ITEM_GROUP", "INSURANCE", "DAYS_LATE_BUCKET"]
+# 15. Group-level rollups
+groupings = ["PATIENT_GROUP","ITEM_GROUP","INSURANCE","DAYS_LATE_BUCKET"]
 for grp in groupings:
     session.sql(f"TRUNCATE TABLE BEHAVIOR_BY_{grp}").collect()
     df_grp = (
@@ -186,18 +189,17 @@ for grp in groupings:
     )
     df_grp.write.save_as_table(f"BEHAVIOR_BY_{grp}", mode="overwrite")
 
-# 10. Monthly behavior trends for past 24 months
-start_date = date.today() - timedelta(days=730)
+# 16. Monthly behavior trends (last 24 months)
+start_date = today - timedelta(days=730)
 monthly_trends = (
     order_intervals
     .with_column("MONTH", F.date_trunc("month", F.col("SERVICEDATEOFORDER")))
     .filter(F.col("MONTH") >= F.lit(start_date))
-    .group_by("MONTH")
-    .agg(
+    .group_by("MONTH").agg(
         F.count_distinct("PATIENTID").alias("ACTIVE_PATIENTS"),
         F.count("ORDERNUMBER").alias("TOTAL_ORDERS"),
         F.avg("DAYS_AFTER_ELIGIBLE").alias("AVG_DAYS_LATE"),
-        (F.sum("ON_TIME_FLAG") / F.count("ORDERNUMBER")).alias("ON_TIME_RATE"),
+        (F.sum("ON_TIME_FLAG")/F.count("ORDERNUMBER")).alias("ON_TIME_RATE"),
         F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE")
     )
     .order_by("MONTH")
@@ -205,6 +207,6 @@ monthly_trends = (
 session.sql("TRUNCATE TABLE MONTHLY_BEHAVIOR_TRENDS").collect()
 monthly_trends.write.save_as_table("MONTHLY_BEHAVIOR_TRENDS", mode="overwrite")
 
-# 11. Close session
+# 17. Close session
 session.close()
 ```
