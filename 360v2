@@ -1,7 +1,7 @@
 ```python
 # hme_key_metrics.py
 # Full Patient-Level & Aggregate Behavior Analysis for HME Business
-# Writes outputs directly into pre-created Snowflake tables
+# Writes outputs directly into pre-created Snowflake tables and per-group rollups/views
 
 from snowflake.snowpark import Session, Window, DataFrame as SnowparkDataFrame
 from snowflake.snowpark import functions as F
@@ -36,11 +36,14 @@ first_order = orders.group_by("PATIENTID").agg(
 last_order = orders.group_by("PATIENTID").agg(
     F.max("SERVICEDATEOFORDER").alias("LAST_SERVICE_DATE")
 )
+
 freq_amt = orders.group_by("PATIENTID").agg(
     F.count("ORDERNUMBER").alias("ORDERS_TOTAL"),
     F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE"),
     F.sum("TOTALQTY").alias("TOTAL_QTY")
 )
+
+# static attributes: most recent row per patient
 attr_window = Window.partition_by("PATIENTID").order_by(F.col("SERVICEDATEOFORDER").desc())
 patient_attrs = (
     orders
@@ -48,6 +51,7 @@ patient_attrs = (
     .filter(F.col("rn") == 1)
     .select("PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP")
 )
+
 descriptive = (
     first_order
     .join(last_order, on="PATIENTID")
@@ -64,7 +68,7 @@ descriptive = (
     .na.fill({"ORDERS_TOTAL": 0, "TOTAL_REVENUE": 0, "TOTAL_QTY": 0})
 )
 
-# 5. Compute inter-order lag and on-time metrics
+# 5. Compute inter-order lag and corrected on-time metrics
 lag_window = Window.partition_by("PATIENTID").order_by("SERVICEDATEOFORDER")
 intervals = (
     orders
@@ -79,13 +83,14 @@ intervals = (
     )
     .filter(F.col("PREV_SERVICE_DATE").is_not_null())
     .with_column(
-        "DAYS_FROM_ELIGIBLE",
+        "DAYS_AFTER_ELIGIBLE",
         F.datediff('day', F.col("ELIGIBLETOSHIP"), F.col("SERVICEDATEOFORDER"))
     )
     .with_column(
         "ON_TIME_FLAG",
         F.when(
-            F.col("DAYS_FROM_ELIGIBLE") <= (F.col("SUPPLYDURATION") * 0.1),
+            (F.col("DAYS_AFTER_ELIGIBLE") >= 0) &
+            (F.col("DAYS_AFTER_ELIGIBLE") <= (F.col("SUPPLYDURATION") * 0.1)),
             1
         ).otherwise(0)
     )
@@ -96,7 +101,9 @@ df_patient_metrics = (
     descriptive.join(
         intervals.group_by("PATIENTID").agg(
             F.avg("DAYS_BETWEEN_ORDERS").alias("AVG_DAYS_BETWEEN"),
-            F.avg("DAYS_FROM_ELIGIBLE").alias("AVG_DAYS_LATE"),
+            F.avg(
+                F.when(F.col("DAYS_AFTER_ELIGIBLE") > 0, F.col("DAYS_AFTER_ELIGIBLE")).otherwise(F.lit(0))
+            ).alias("AVG_DAYS_LATE"),
             F.sum("ON_TIME_FLAG").alias("ON_TIME_ORDERS"),
             F.count("ORDERNUMBER").alias("TOTAL_ORDERS"),
             F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE_ORDERS")
@@ -113,8 +120,8 @@ df_patient_metrics = (
     )
 )
 
-# 7. Roll-up Summary with distribution metrics
-df_rollup = (
+# 7. Roll-up Summary across all patients
+df_rollup_all = (
     df_patient_metrics.agg(
         F.avg("TENURE_DAYS").alias("AVG_TENURE_DAYS"),
         F.avg("RECENCY_DAYS").alias("AVG_RECENCY_DAYS"),
@@ -123,19 +130,49 @@ df_rollup = (
         F.avg("AVG_DAYS_BETWEEN").alias("AVG_DAYS_BETWEEN_ORDERS"),
         F.avg("AVG_DAYS_LATE").alias("AVG_DAYS_LATE"),
         F.avg("ON_TIME_RATE").alias("AVG_ON_TIME_RATE"),
-        F.expr("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY AVG_DAYS_BETWEEN)").alias("MEDIAN_DAYS_BETWEEN"),
-        F.expr("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ON_TIME_RATE)").alias("MEDIAN_ON_TIME_RATE"),
-        F.expr("PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY AVG_DAYS_LATE)").alias("PCT25_DAYS_LATE"),
-        F.expr("PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY AVG_DAYS_LATE)").alias("PCT75_DAYS_LATE")
     )
 )
 
-# 8. Write results to Snowflake tables (auto-create or overwrite)
-#    Use positional table_name argument
-#    Replace with your fully qualified table if needed: "DB.SCHEMA.TABLE"
-df_patient_metrics.write.save_as_table("PATIENT_BEHAVIOR_METRICS", mode="overwrite")
-df_rollup.write.save_as_table("PATIENT_METRICS_ROLLUP", mode="overwrite")
+# 8. Roll-up by ITEM_GROUP, PATIENT_GROUP, and INSURANCE
+#    independent roll-ups for each group
+groupings = ["ITEM_GROUP", "PATIENT_GROUP", "INSURANCE"]
+rollup_by = {}
+for grp in groupings:
+    rollup_by[grp] = (
+        df_patient_metrics
+        .group_by(grp)
+        .agg(
+            F.avg("TENURE_DAYS").alias("AVG_TENURE_DAYS"),
+            F.avg("RECENCY_DAYS").alias("AVG_RECENCY_DAYS"),
+            F.avg("ORDERS_TOTAL").alias("AVG_FREQ_PER_PATIENT"),
+            F.avg("TOTAL_REVENUE").alias("AVG_REV_PER_PATIENT"),
+            F.avg("AVG_DAYS_BETWEEN").alias("AVG_DAYS_BETWEEN_ORDERS"),
+            F.avg("AVG_DAYS_LATE").alias("AVG_DAYS_LATE"),
+            F.avg("ON_TIME_RATE").alias("AVG_ON_TIME_RATE")
+        )
+    )
 
-# 9. Close session
+# 9. Truncate existing tables
+session.sql("TRUNCATE TABLE PATIENT_BEHAVIOR_METRICS").collect()
+session.sql("TRUNCATE TABLE PATIENT_METRICS_ROLLUP").collect()
+# Truncate intermediate roll-up views/tables if needed
+for grp in groupings:
+    session.sql(f"TRUNCATE TABLE ROLLUP_{grp}").collect()
+
+# 10. Write results to Snowflake tables
+#    Base tables
+df_patient_metrics.write.save_as_table("PATIENT_BEHAVIOR_METRICS", mode="overwrite")
+df_rollup_all.write.save_as_table("PATIENT_METRICS_ROLLUP", mode="overwrite")
+#    Per-group rollups
+def write_rollup(name, df):
+    df.write.save_as_table(f"ROLLUP_{name}", mode="overwrite")
+for grp, df in rollup_by.items():
+    write_rollup(grp, df)
+
+# 11. Optionally create views in Snowflake for each rollup
+for grp in groupings:
+    session.sql(f"CREATE OR REPLACE VIEW VW_ROLLUP_{grp} AS SELECT * FROM ROLLUP_{grp}").collect()
+
+# 12. Close session
 session.close()
 ```
