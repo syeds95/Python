@@ -1,199 +1,127 @@
 ```python
-# hme_key_metrics.py
-# Complete Patient-Level & Aggregate Behavior Analysis for HME Business
-# Corrected code: removed duplicate LTV logic and ensured valid group_by
+# hme_key_metrics_pandas.py
+# Patient-Level & Aggregate Behavior Analysis using pandas & numpy
+# Works on pandas DataFrame `my_df` and prints results at the end
 
-from snowflake.snowpark import Session, Window, DataFrame as SnowparkDataFrame
-from snowflake.snowpark import functions as F
-from datetime import date, timedelta
-import os
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
 
-# 1. Connect to Snowflake
-def create_session():
-    conn_params = {
-        'account': os.getenv('SNOWFLAKE_ACCOUNT'),
-        'user': os.getenv('SNOWFLAKE_USER'),
-        'password': os.getenv('SNOWFLAKE_PASSWORD'),
-        'role': os.getenv('SNOWFLAKE_ROLE', 'PUBLIC'),
-        'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
-        'database': os.getenv('SNOWFLAKE_DATABASE'),
-        'schema': os.getenv('SNOWFLAKE_SCHEMA')
-    }
-    return Session.builder.configs(conn_params).create()
+# Assume `my_df` is a pandas DataFrame with columns:
+# PATIENTID, ORDERNUMBER, HCPCS, SERVICEDATEOFORDER (datetime), ELIGIBLETOSHIP (datetime),
+# SUPPLYDURATION (numeric days), TOTALAMOUNT, TOTALQTY, INSURANCE, PATIENT_GROUP, ITEM_GROUP
 
-session = create_session()
+df = my_df.copy()
+# Ensure dates are datetime
+df['SERVICEDATEOFORDER'] = pd.to_datetime(df['SERVICEDATEOFORDER'])
+df['ELIGIBLETOSHIP'] = pd.to_datetime(df['ELIGIBLETOSHIP'])
+today = pd.to_datetime(datetime.today().date())
 
-# 2. Load the source DataFrame
-if not isinstance(my_df, SnowparkDataFrame):
-    orders = session.create_dataframe(my_df)
-else:
-    orders = my_df
+# 1. Descriptive RFM + tenure + static attributes
+desc = df.groupby('PATIENTID').agg(
+    FIRST_SERVICE_DATE=('SERVICEDATEOFORDER','min'),
+    LAST_SERVICE_DATE=('SERVICEDATEOFORDER','max'),
+    ORDERS_TOTAL=('ORDERNUMBER','nunique'),
+    TOTAL_REVENUE=('TOTALAMOUNT','sum'),
+    TOTAL_QTY=('TOTALQTY','sum')
+)
+# static attrs: take last row per patient
+last = df.sort_values('SERVICEDATEOFORDER').groupby('PATIENTID').tail(1)[
+    ['PATIENTID','INSURANCE','PATIENT_GROUP','ITEM_GROUP']
+].set_index('PATIENTID')
+desc = desc.join(last)
+# tenure & recency
+desc['TENURE_DAYS'] = (today - desc['FIRST_SERVICE_DATE']).dt.days
+desc['RECENCY_DAYS'] = (today - desc['LAST_SERVICE_DATE']).dt.days
 
-# 3. Reference date
-today = date.today()
+# 2. Order-level metrics: dedupe and lag
+orders = df.drop_duplicates(subset=['ORDERNUMBER'])
+orders = orders.sort_values(['PATIENTID','SERVICEDATEOFORDER'])
+orders[['PREV_DATE','PREV_ELIGIBLE']] = orders.groupby('PATIENTID')[['SERVICEDATEOFORDER','ELIGIBLETOSHIP']].shift(1)
+orders = orders.dropna(subset=['PREV_DATE','PREV_ELIGIBLE'])
+orders['DAYS_BETWEEN'] = (orders['SERVICEDATEOFORDER'] - orders['PREV_DATE']).dt.days
+orders['DAYS_AFTER_ELIGIBLE'] = (orders['SERVICEDATEOFORDER'] - orders['PREV_ELIGIBLE']).dt.days
+orders['ON_TIME_FLAG'] = np.where(
+    (orders['DAYS_AFTER_ELIGIBLE'] >= 0) &
+    (orders['DAYS_AFTER_ELIGIBLE'] <= orders['SUPPLYDURATION'] * 0.1), 1, 0
+)
+ord_metrics = orders.groupby('PATIENTID').agg(
+    AVG_DAYS_BETWEEN=('DAYS_BETWEEN','mean'),
+    AVG_DAYS_LATE=('DAYS_AFTER_ELIGIBLE', lambda x: np.mean(x[x>0]) if len(x[x>0])>0 else 0),
+    ON_TIME_ORDERS=('ON_TIME_FLAG','sum'),
+    TOTAL_ORDERS=('ORDERNUMBER','count'),
+    REVENUE_ORDERS=('TOTALAMOUNT','sum')
+)
 
-# 4. Descriptive patient attributes (RFM + tenure + static)
-win_desc = Window.partition_by("PATIENTID").order_by(F.col("SERVICEDATEOFORDER").desc())
-descriptive = (
-    orders
-    .group_by("PATIENTID").agg(
-        F.min("SERVICEDATEOFORDER").alias("FIRST_SERVICE_DATE"),
-        F.max("SERVICEDATEOFORDER").alias("LAST_SERVICE_DATE"),
-        F.count_distinct("ORDERNUMBER").alias("ORDERS_TOTAL"),
-        F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE"),
-        F.sum("TOTALQTY").alias("TOTAL_QTY")
+# 3. Churn flag
+last_supply = orders.groupby('PATIENTID')['SUPPLYDURATION'].max().rename('LAST_SUPPLY_DURATION')
+desc = desc.join(last_supply, how='left')
+desc['CHURN_FLAG'] = np.where(desc['RECENCY_DAYS'] > desc['LAST_SUPPLY_DURATION'] * 1.1, 1, 0)
+
+# 4. Time to first reorder
+def second_date(g):
+    dates = g['SERVICEDATEOFORDER'].sort_values()
+    return dates.iloc[1] if len(dates)>1 else pd.NaT
+sec = df.groupby('PATIENTID').apply(second_date).rename('SECOND_DATE')
+tf = desc.join(sec)
+tf['TIME_TO_FIRST_REORDER'] = (tf['SECOND_DATE'] - tf['FIRST_SERVICE_DATE']).dt.days
+
+# 5. LTV curves
+orders_with_first = df.join(desc['FIRST_SERVICE_DATE'], on='PATIENTID')
+for d in [30,60,90,180,365]:
+    orders_with_first[f'LTV_{d}d'] = np.where(
+        (orders_with_first['SERVICEDATEOFORDER'] - orders_with_first['FIRST_SERVICE_DATE']).dt.days <= d,
+        orders_with_first['TOTALAMOUNT'], 0
     )
-    .join(
-        orders.with_column("rn", F.row_number().over(win_desc))
-              .filter(F.col("rn") == 1)
-              .select("PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP"),
-        on="PATIENTID", how="left"
-    )
-    .with_column("TENURE_DAYS", F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.lit(today)))
-    .with_column("RECENCY_DAYS", F.datediff('day', F.col("LAST_SERVICE_DATE"), F.lit(today)))
+ltv = orders_with_first.groupby('PATIENTID')[[f'LTV_{d}d' for d in [30,60,90,180,365]]].sum()
+
+# 6. Basket composition
+distinct_items = df.groupby('PATIENTID')['HCPCS'].nunique().rename('UNIQUE_HCPCS')
+
+# 7. Seasonality
+distinct_months = df.assign(
+    MONTH=lambda x: x['SERVICEDATEOFORDER'].dt.to_period('M')
+).groupby('PATIENTID')['MONTH'].nunique().rename('ACTIVE_MONTHS')
+
+# 8. Assemble patient DataFrame
+patient = desc.join(ord_metrics).join(tf['TIME_TO_FIRST_REORDER']).join(ltv).join(distinct_items).join(distinct_months)
+patient['ON_TIME_RATE'] = np.where(patient['TOTAL_ORDERS']>0, patient['ON_TIME_ORDERS']/patient['TOTAL_ORDERS'], 0)
+# days late bucket
+patient['DAYS_LATE_BUCKET'] = pd.cut(
+    patient['AVG_DAYS_LATE'], bins=[-1,3,7,14,30,60,90,np.inf],
+    labels=["0-3","4-7","8-14","15-30","31-60","61-90",">90"]
 )
 
-# 5. Deduplicate orders to one row per order
-orders_dedup = (
-    orders
-    .select("PATIENTID", "ORDERNUMBER", "SERVICEDATEOFORDER", "ELIGIBLETOSHIP", "SUPPLYDURATION", "TOTALAMOUNT")
-    .distinct()
-)
+# 9. Print patient-level table
+print("=== Patient-Level Metrics ===")
+print(patient.reset_index().head(10))
 
-# 6. Order-level lag & on-time metrics
-win_ord = Window.partition_by("PATIENTID").order_by("SERVICEDATEOFORDER")
-order_intervals = (
-    orders_dedup
-    .with_column("PREV_DATE", F.lag("SERVICEDATEOFORDER").over(win_ord))
-    .with_column("PREV_ELIGIBLE", F.lag("ELIGIBLETOSHIP").over(win_ord))
-    .filter(F.col("PREV_DATE").is_not_null())
-    .with_column("DAYS_BETWEEN", F.datediff('day', F.col("PREV_DATE"), F.col("SERVICEDATEOFORDER")))
-    .with_column("DAYS_AFTER_ELIGIBLE", F.datediff('day', F.col("PREV_ELIGIBLE"), F.col("SERVICEDATEOFORDER")))
-    .with_column(
-        "ON_TIME_FLAG",
-        F.when(
-            (F.col("DAYS_AFTER_ELIGIBLE") >= 0) &
-            (F.col("DAYS_AFTER_ELIGIBLE") <= F.col("SUPPLYDURATION") * 0.1), 1
-        ).otherwise(0)
-    )
-)
-order_metrics = (
-    order_intervals
-    .group_by("PATIENTID").agg(
-        F.avg("DAYS_BETWEEN").alias("AVG_DAYS_BETWEEN"),
-        F.avg(F.when(F.col("DAYS_AFTER_ELIGIBLE") > 0, F.col("DAYS_AFTER_ELIGIBLE")).otherwise(0)).alias("AVG_DAYS_LATE"),
-        F.sum("ON_TIME_FLAG").alias("ON_TIME_ORDERS"),
-        F.count("ORDERNUMBER").alias("TOTAL_ORDERS"),
-        F.sum("TOTALAMOUNT").alias("REVENUE_ORDERS")
-    )
-)
+# 10. Group rollups
+for grp in ['PATIENT_GROUP','ITEM_GROUP','INSURANCE','DAYS_LATE_BUCKET']:
+    grp_tbl = patient.reset_index().groupby(grp).agg(
+        AVG_TENURE_DAYS=('TENURE_DAYS','mean'),
+        AVG_RECENCY_DAYS=('RECENCY_DAYS','mean'),
+        AVG_FREQ_PER_PATIENT=('ORDERS_TOTAL','mean'),
+        AVG_REV_PER_PATIENT=('TOTAL_REVENUE','mean'),
+        AVG_DAYS_BETWEEN_ORDERS=('AVG_DAYS_BETWEEN','mean'),
+        AVG_DAYS_LATE=('AVG_DAYS_LATE','mean'),
+        AVG_ON_TIME_RATE=('ON_TIME_RATE','mean'),
+        PATIENT_COUNT=('PATIENTID','count')
+    ).reset_index()
+    print(f"=== Rollup by {grp} ===")
+    print(grp_tbl)
 
-# 7. Churn flag based on last supply duration
-last_supply = orders_dedup.group_by("PATIENTID").agg(F.max("SUPPLYDURATION").alias("LAST_SUPPLY_DURATION"))
-churn = (
-    descriptive
-    .join(last_supply, on="PATIENTID")
-    .with_column(
-        "CHURN_FLAG",
-        F.when(F.col("RECENCY_DAYS") > F.col("LAST_SUPPLY_DURATION") * 1.1, 1).otherwise(0)
-    )
-)
-
-# 8. Time to first reorder
-time_to_first = (
-    orders_dedup
-    .with_column("rn", F.row_number().over(win_ord))
-    .filter(F.col("rn") == 2)
-    .select("PATIENTID", F.col("SERVICEDATEOFORDER").alias("SECOND_DATE"))
-)
-time_to_first = (
-    descriptive
-    .join(time_to_first, on="PATIENTID", how="left")
-    .with_column("TIME_TO_FIRST_REORDER", F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.col("SECOND_DATE")))
-)
-
-# 9. LTV calculation
-orders_with_first = (
-    orders
-    .join(descriptive.select("PATIENTID", "FIRST_SERVICE_DATE"), on="PATIENTID", how="left")
-    .select("PATIENTID", "FIRST_SERVICE_DATE", "SERVICEDATEOFORDER", "TOTALAMOUNT")
-)
-ltv_thresholds = [30, 60, 90, 180, 365]
-ltv = orders_with_first
-for d in ltv_thresholds:
-    ltv = ltv.with_column(
-        f"LTV_{d}d",
-        F.when(
-            F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.col("SERVICEDATEOFORDER")) <= d,
-            F.col("TOTALAMOUNT")
-        ).otherwise(0)
-    )
-ltv = (
-    ltv.group_by("PATIENTID").agg(
-        *[F.sum(f"LTV_{d}d").alias(f"LTV_{d}d") for d in ltv_thresholds]
-    )
-)
-
-# 10. Basket composition
-distinct_items = orders.group_by("PATIENTID").agg(F.count_distinct("HCPCS").alias("UNIQUE_HCPCS"))
-
-# 11. Seasonality
-distinct_months = (
-    orders
-    .with_column("MONTH", F.date_trunc("month", F.col("SERVICEDATEOFORDER")))
-    .group_by("PATIENTID").agg(F.count_distinct("MONTH").alias("ACTIVE_MONTHS"))
-)
-
-# 12. Assemble final patient-level table
-df_patient = (
-    descriptive
-    .join(order_metrics, on="PATIENTID", how="left")
-    .join(churn.select("PATIENTID","CHURN_FLAG"), on="PATIENTID", how="left")
-    .join(time_to_first.select("PATIENTID","TIME_TO_FIRST_REORDER"), on="PATIENTID", how="left")
-    .join(ltv, on="PATIENTID", how="left")
-    .join(distinct_items, on="PATIENTID", how="left")
-    .join(distinct_months, on="PATIENTID", how="left")
-    .with_column("ON_TIME_RATE", F.when(F.col("TOTAL_ORDERS") > 0, F.col("ON_TIME_ORDERS") / F.col("TOTAL_ORDERS")).otherwise(F.lit(0)))
-    .with_column(
-        "DAYS_LATE_BUCKET",
-        F.when(F.col("AVG_DAYS_LATE") <= 3, "0-3 days late")
-         .when(F.col("AVG_DAYS_LATE") <= 7, "4-7 days late")
-         .when(F.col("AVG_DAYS_LATE") <= 14, "8-14 days late")
-         .when(F.col("AVG_DAYS_LATE") <= 30, "15-30 days late")
-         .when(F.col("AVG_DAYS_LATE") <= 60, "31-60 days late")
-         .when(F.col("AVG_DAYS_LATE") <= 90, "61-90 days late")
-         .otherwise(">90 days late")
-    )
-)
-
-# 13. Persist patient-level metrics
-session.sql("TRUNCATE TABLE PATIENT_BEHAVIOR_METRICS").collect()
-# Write the DataFrame into the table
-df_patient.write.save_as_table("PATIENT_BEHAVIOR_METRICS", mode="overwrite")
-
-# 14. Persist group-level rollups
-groupings = ["PATIENT_GROUP","ITEM_GROUP","INSURANCE","DAYS_LATE_BUCKET"]
-for grp in groupings:
-    session.sql(f"TRUNCATE TABLE BEHAVIOR_BY_{grp}").collect()
-    df_grp = (
-        df_patient
-        .group_by(grp)
-        .agg(
-            F.avg("TENURE_DAYS").alias("AVG_TENURE_DAYS"),
-            F.avg("RECENCY_DAYS").alias("AVG_RECENCY_DAYS"),
-            F.avg("ORDERS_TOTAL").alias("AVG_FREQ_PER_PATIENT"),
-            F.avg("TOTAL_REVENUE").alias("AVG_REV_PER_PATIENT"),
-            F.avg("AVG_DAYS_BETWEEN").alias("AVG_DAYS_BETWEEN_ORDERS"),
-            F.avg("AVG_DAYS_LATE").alias("AVG_DAYS_LATE"),
-            F.avg("ON_TIME_RATE").alias("AVG_ON_TIME_RATE"),
-            F.count("PATIENTID").alias("PATIENT_COUNT")
-        )
-    )
-    df_grp.write.save_as_table(f"BEHAVIOR_BY_{grp}", mode="overwrite")
-
-# 15. Persist monthly trends
-session.sql("TRUNCATE TABLE MONTHLY_BEHAVIOR_TRENDS").collect()
-monthly_trends.write.save_as_table("MONTHLY_BEHAVIOR_TRENDS", mode="overwrite")
-
-# 16. Close session
-session.close()
+# 11. Monthly trends
+o = orders.copy()
+o['MONTH'] = o['SERVICEDATEOFORDER'].dt.to_period('M').dt.to_timestamp()
+o = o[o['MONTH'] >= (today - pd.DateOffset(months=24))]
+monthly = o.groupby('MONTH').agg(
+    ACTIVE_PATIENTS=('PATIENTID', lambda x: x.nunique()),
+    TOTAL_ORDERS=('ORDERNUMBER','count'),
+    AVG_DAYS_LATE=('DAYS_AFTER_ELIGIBLE','mean'),
+    ON_TIME_RATE=('ON_TIME_FLAG',lambda x: x.sum()/len(x) if len(x)>0 else 0),
+    TOTAL_REVENUE=('TOTALAMOUNT','sum')
+).reset_index()
+print("=== Monthly Behavior Trends ===")
+print(monthly)
+```
