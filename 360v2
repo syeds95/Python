@@ -111,10 +111,31 @@ time_to_first = (
     .with_column("TIME_TO_FIRST_REORDER", F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.col("SECOND_DATE")))
 )
 
-# 9. Join FIRST_SERVICE_DATE into orders for LTV calculation
-orders_with_first = orders.join(descriptive.select("PATIENTID","FIRST_SERVICE_DATE"), on="PATIENTID")
+# 9. Prepare for LTV calculation: join FIRST_SERVICE_DATE to each order
+orders_with_first = (
+    orders
+    .join(descriptive.select("PATIENTID", "FIRST_SERVICE_DATE"), on="PATIENTID", how="left")
+    .select("PATIENTID", "FIRST_SERVICE_DATE", "SERVICEDATEOFORDER", "TOTALAMOUNT")
+)
 
-# 10. LTV curves at 30/60/90/180/365 days
+# 10. LTV curves at day thresholds: sum revenue up to days since first order
+ltv_thresholds = [30, 60, 90, 180, 365]
+ltv = orders_with_first
+for d in ltv_thresholds:
+    ltv = ltv.with_column(
+        f"LTV_{d}d",
+        F.when(
+            F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.col("SERVICEDATEOFORDER")) <= d,
+            F.col("TOTALAMOUNT")
+        ).otherwise(0)
+    )
+# Aggregate by PATIENTID
+ltv = (
+    ltv.group_by("PATIENTID").agg(
+        *[F.sum(f"LTV_{d}d").alias(f"LTV_{d}d") for d in ltv_thresholds]
+    )
+)
+
 ltv_thresholds = [30, 60, 90, 180, 365]
 ltv = (
     orders_with_first
