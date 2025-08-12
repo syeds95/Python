@@ -1,15 +1,26 @@
+CREATE OR REPLACE TABLE MONTHLY_BEHAVIOR_TRENDS (
+  MONTH DATE,
+  ACTIVE_PATIENTS INTEGER,
+  TOTAL_ORDERS INTEGER,
+  AVG_DAYS_LATE DOUBLE,
+  ON_TIME_RATE DOUBLE,
+  TOTAL_REVENUE DECIMAL(18,2)
+);
+
+
 ```python
 # hme_key_metrics.py
-# Full Patient-Level & Aggregate Behavior Analysis for HME Business
-# Writes outputs directly into pre-created Snowflake tables and per-group rollups/views
+# Complete Patient-Level & Aggregate Behavior Analysis for HME Business
+# Includes RFM, churn, reactivation, time-to-first-reorder, LTV curves, basket composition,
+# seasonality, lateness bucketing, group rollups, and monthly trend analysis.
 
 from snowflake.snowpark import Session, Window, DataFrame as SnowparkDataFrame
 from snowflake.snowpark import functions as F
-from datetime import date
+from datetime import date, timedelta
 import os
 
 # 1. Connect to Snowflake
-tmp = {
+conn_params = {
     'account': os.getenv('SNOWFLAKE_ACCOUNT'),
     'user': os.getenv('SNOWFLAKE_USER'),
     'password': os.getenv('SNOWFLAKE_PASSWORD'),
@@ -18,74 +29,52 @@ tmp = {
     'database': os.getenv('SNOWFLAKE_DATABASE'),
     'schema': os.getenv('SNOWFLAKE_SCHEMA')
 }
-session = Session.builder.configs(tmp).create()
+session = Session.builder.configs(conn_params).create()
 
-# 2. Load source data from your Snowpark DataFrame (my_df)
+# 2. Load input DataFrame (my_df must be a Snowpark DataFrame)
 if not isinstance(my_df, SnowparkDataFrame):
     orders = session.create_dataframe(my_df)
 else:
     orders = my_df
 
-# 3. Reference date for recency and tenure calculations
+# 3. Reference date for tenure/recency calculations
 today = date.today()
 
-# 4. Compute descriptive patient attributes
-first_order = orders.group_by("PATIENTID").agg(
-    F.min("SERVICEDATEOFORDER").alias("FIRST_SERVICE_DATE")
-)
-last_order = orders.group_by("PATIENTID").agg(
-    F.max("SERVICEDATEOFORDER").alias("LAST_SERVICE_DATE")
-)
-
-freq_amt = orders.group_by("PATIENTID").agg(
-    F.count("ORDERNUMBER").alias("ORDERS_TOTAL"),
-    F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE"),
-    F.sum("TOTALQTY").alias("TOTAL_QTY")
-)
-
-# static attributes: most recent row per patient
-attr_window = Window.partition_by("PATIENTID").order_by(F.col("SERVICEDATEOFORDER").desc())
-patient_attrs = (
-    orders
-    .with_column("rn", F.row_number().over(attr_window))
-    .filter(F.col("rn") == 1)
-    .select("PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP")
-)
-
+# 4. Descriptive patient attributes (RFM + tenure)
+win_desc = Window.partition_by("PATIENTID").order_by(F.col("SERVICEDATEOFORDER").desc())
 descriptive = (
-    first_order
-    .join(last_order, on="PATIENTID")
-    .join(freq_amt, on="PATIENTID", how="left")
-    .join(patient_attrs, on="PATIENTID", how="left")
-    .with_column(
-        "TENURE_DAYS",
-        F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.lit(today))
+    orders
+    .group_by("PATIENTID").agg(
+        F.min("SERVICEDATEOFORDER").alias("FIRST_SERVICE_DATE"),
+        F.max("SERVICEDATEOFORDER").alias("LAST_SERVICE_DATE"),
+        F.count_distinct("ORDERNUMBER").alias("ORDERS_TOTAL"),
+        F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE"),
+        F.sum("TOTALQTY").alias("TOTAL_QTY")
     )
-    .with_column(
-        "RECENCY_DAYS",
-        F.datediff('day', F.col("LAST_SERVICE_DATE"),  F.lit(today))
+    .join(
+        orders.with_column("rn", F.row_number().over(win_desc))
+              .filter(F.col("rn") == 1)
+              .select("PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP"),
+        on="PATIENTID", how="left"
     )
-    .na.fill({"ORDERS_TOTAL": 0, "TOTAL_REVENUE": 0, "TOTAL_QTY": 0})
+    .with_column("TENURE_DAYS", F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.lit(today)))
+    .with_column("RECENCY_DAYS", F.datediff('day', F.col("LAST_SERVICE_DATE"), F.lit(today)))
 )
 
-# 5. Compute inter-order lag and corrected on-time metrics
-lag_window = Window.partition_by("PATIENTID").order_by("SERVICEDATEOFORDER")
-intervals = (
+# 5. Order-level lag & on-time metrics
+orders_dedup = (
     orders
-    .select(
-        "PATIENTID", "ORDERNUMBER", "HCPCS", "SERVICEDATEOFORDER",
-        "ELIGIBLETOSHIP", "SUPPLYDURATION", "TOTALAMOUNT"
-    )
-    .with_column("PREV_SERVICE_DATE", F.lag("SERVICEDATEOFORDER").over(lag_window))
-    .with_column(
-        "DAYS_BETWEEN_ORDERS",
-        F.datediff('day', F.col("PREV_SERVICE_DATE"), F.col("SERVICEDATEOFORDER"))
-    )
-    .filter(F.col("PREV_SERVICE_DATE").is_not_null())
-    .with_column(
-        "DAYS_AFTER_ELIGIBLE",
-        F.datediff('day', F.col("ELIGIBLETOSHIP"), F.col("SERVICEDATEOFORDER"))
-    )
+    .select("PATIENTID", "ORDERNUMBER", "SERVICEDATEOFORDER", "ELIGIBLETOSHIP", "SUPPLYDURATION", "TOTALAMOUNT")
+    .distinct()
+)
+win_ord = Window.partition_by("PATIENTID").order_by("SERVICEDATEOFORDER")
+order_intervals = (
+    orders_dedup
+    .with_column("PREV_DATE", F.lag("SERVICEDATEOFORDER").over(win_ord))
+    .with_column("PREV_ELIGIBLE", F.lag("ELIGIBLETOSHIP").over(win_ord))
+    .filter(F.col("PREV_DATE").is_not_null())
+    .with_column("DAYS_BETWEEN", F.datediff('day', F.col("PREV_DATE"), F.col("SERVICEDATEOFORDER")))
+    .with_column("DAYS_AFTER_ELIGIBLE", F.datediff('day', F.col("PREV_ELIGIBLE"), F.col("SERVICEDATEOFORDER")))
     .with_column(
         "ON_TIME_FLAG",
         F.when(
@@ -95,51 +84,94 @@ intervals = (
         ).otherwise(0)
     )
 )
-
-# 6. Patient-level Aggregations
-df_patient_metrics = (
-    descriptive.join(
-        intervals.group_by("PATIENTID").agg(
-            F.avg("DAYS_BETWEEN_ORDERS").alias("AVG_DAYS_BETWEEN"),
-            F.avg(
-                F.when(F.col("DAYS_AFTER_ELIGIBLE") > 0, F.col("DAYS_AFTER_ELIGIBLE")).otherwise(F.lit(0))
-            ).alias("AVG_DAYS_LATE"),
-            F.sum("ON_TIME_FLAG").alias("ON_TIME_ORDERS"),
-            F.count("ORDERNUMBER").alias("TOTAL_ORDERS"),
-            F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE_ORDERS")
-        ), on="PATIENTID", how="left"
+order_metrics = (
+    order_intervals
+    .group_by("PATIENTID").agg(
+        F.avg("DAYS_BETWEEN").alias("AVG_DAYS_BETWEEN"),
+        F.avg(F.when(F.col("DAYS_AFTER_ELIGIBLE") > 0, F.col("DAYS_AFTER_ELIGIBLE")).otherwise(0)).alias("AVG_DAYS_LATE"),
+        F.sum("ON_TIME_FLAG").alias("ON_TIME_ORDERS"),
+        F.count("ORDERNUMBER").alias("TOTAL_ORDERS"),
+        F.sum("TOTALAMOUNT").alias("REVENUE_ORDERS")
     )
+)
+
+# 6. Additional patient behaviors
+# 6a. Churn flag: if last recency > 1.1 * last supply duration
+last_supply = orders_dedup.group_by("PATIENTID").agg(F.max("SUPPLYDURATION").alias("LAST_SUPPLY_DURATION"))
+churn = (
+    descriptive
+    .join(last_supply, on="PATIENTID")
     .with_column(
-        "ON_TIME_RATE",
-        F.col("ON_TIME_ORDERS") / F.col("TOTAL_ORDERS")
+        "CHURN_FLAG",
+        F.when(F.col("RECENCY_DAYS") > F.col("LAST_SUPPLY_DURATION") * 1.1, 1).otherwise(0)
     )
-    .select(
-        "PATIENTID", "INSURANCE", "PATIENT_GROUP", "ITEM_GROUP",
-        "TENURE_DAYS", "RECENCY_DAYS", "ORDERS_TOTAL", "TOTAL_REVENUE", "TOTAL_QTY",
-        "AVG_DAYS_BETWEEN", "AVG_DAYS_LATE", "ON_TIME_RATE"
+)
+# 6b. Time to first reorder
+second_order = (
+    orders_dedup
+    .with_column("rn", F.row_number().over(win_ord))
+    .filter(F.col("rn") == 2)
+    .select("PATIENTID", F.col("SERVICEDATEOFORDER").alias("SECOND_DATE"))
+)
+time_to_first = (
+    descriptive
+    .join(second_order, on="PATIENTID", how="left")
+    .with_column("TIME_TO_FIRST_REORDER", F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.col("SECOND_DATE")))
+)
+# 6c. LTV curves: cumulative revenue at set day thresholds
+ltv_thresholds = [30, 60, 90, 180, 365]
+ltv = orders
+ltv = ltv.select(
+    "PATIENTID",
+    *[F.sum(
+         F.when(
+             F.datediff('day', F.col("FIRST_SERVICE_DATE"), F.col("SERVICEDATEOFORDER")) <= d,
+             F.col("TOTALAMOUNT")
+          ).otherwise(0)
+       ).alias(f"LTV_{d}d") for d in ltv_thresholds]
+).group_by("PATIENTID").agg(*[F.max(col).alias(col) for col in [f"LTV_{d}d" for d in ltv_thresholds]])
+# 6d. Basket composition: unique HCPCS count
+distinct_items = orders.group_by("PATIENTID").agg(F.count_distinct("HCPCS").alias("UNIQUE_HCPCS"))
+# 6e. Seasonality: count distinct active months
+distinct_months = (
+    orders
+    .with_column("MONTH", F.date_trunc("month", F.col("SERVICEDATEOFORDER")))
+    .group_by("PATIENTID")
+    .agg(F.count_distinct("MONTH").alias("ACTIVE_MONTHS"))
+)
+
+# 7. Assemble full patient-level dataset
+df_patient = (
+    descriptive
+    .join(order_metrics, on="PATIENTID", how="left")
+    .join(churn.select("PATIENTID", "CHURN_FLAG"), on="PATIENTID", how="left")
+    .join(time_to_first.select("PATIENTID", "TIME_TO_FIRST_REORDER"), on="PATIENTID", how="left")
+    .join(ltv, on="PATIENTID", how="left")
+    .join(distinct_items, on="PATIENTID", how="left")
+    .join(distinct_months, on="PATIENTID", how="left")
+    .with_column("ON_TIME_RATE", F.col("ON_TIME_ORDERS") / F.col("TOTAL_ORDERS"))
+    .with_column(
+        "DAYS_LATE_BUCKET",
+        F.when(F.col("AVG_DAYS_LATE") <= 3, "0-3 days late")
+         .when(F.col("AVG_DAYS_LATE") <= 7, "4-7 days late")
+         .when(F.col("AVG_DAYS_LATE") <= 14, "8-14 days late")
+         .when(F.col("AVG_DAYS_LATE") <= 30, "15-30 days late")
+         .when(F.col("AVG_DAYS_LATE") <= 60, "31-60 days late")
+         .when(F.col("AVG_DAYS_LATE") <= 90, "61-90 days late")
+         .otherwise(">90 days late")
     )
 )
 
-# 7. Roll-up Summary across all patients
-df_rollup_all = (
-    df_patient_metrics.agg(
-        F.avg("TENURE_DAYS").alias("AVG_TENURE_DAYS"),
-        F.avg("RECENCY_DAYS").alias("AVG_RECENCY_DAYS"),
-        F.avg("ORDERS_TOTAL").alias("AVG_FREQ_PER_PATIENT"),
-        F.avg("TOTAL_REVENUE").alias("AVG_REV_PER_PATIENT"),
-        F.avg("AVG_DAYS_BETWEEN").alias("AVG_DAYS_BETWEEN_ORDERS"),
-        F.avg("AVG_DAYS_LATE").alias("AVG_DAYS_LATE"),
-        F.avg("ON_TIME_RATE").alias("AVG_ON_TIME_RATE"),
-    )
-)
+# 8. Persist patient-level metrics
+session.sql("TRUNCATE TABLE PATIENT_BEHAVIOR_METRICS").collect()
+df_patient.write.save_as_table("PATIENT_BEHAVIOR_METRICS", mode="overwrite")
 
-# 8. Roll-up by ITEM_GROUP, PATIENT_GROUP, and INSURANCE
-#    independent roll-ups for each group
-groupings = ["ITEM_GROUP", "PATIENT_GROUP", "INSURANCE"]
-rollup_by = {}
+# 9. Group-level rollups
+groupings = ["PATIENT_GROUP", "ITEM_GROUP", "INSURANCE", "DAYS_LATE_BUCKET"]
 for grp in groupings:
-    rollup_by[grp] = (
-        df_patient_metrics
+    session.sql(f"TRUNCATE TABLE BEHAVIOR_BY_{grp}").collect()
+    df_grp = (
+        df_patient
         .group_by(grp)
         .agg(
             F.avg("TENURE_DAYS").alias("AVG_TENURE_DAYS"),
@@ -148,31 +180,31 @@ for grp in groupings:
             F.avg("TOTAL_REVENUE").alias("AVG_REV_PER_PATIENT"),
             F.avg("AVG_DAYS_BETWEEN").alias("AVG_DAYS_BETWEEN_ORDERS"),
             F.avg("AVG_DAYS_LATE").alias("AVG_DAYS_LATE"),
-            F.avg("ON_TIME_RATE").alias("AVG_ON_TIME_RATE")
+            F.avg("ON_TIME_RATE").alias("AVG_ON_TIME_RATE"),
+            F.count("PATIENTID").alias("PATIENT_COUNT")
         )
     )
+    df_grp.write.save_as_table(f"BEHAVIOR_BY_{grp}", mode="overwrite")
 
-# 9. Truncate existing tables
-session.sql("TRUNCATE TABLE PATIENT_BEHAVIOR_METRICS").collect()
-session.sql("TRUNCATE TABLE PATIENT_METRICS_ROLLUP").collect()
-# Truncate intermediate roll-up views/tables if needed
-for grp in groupings:
-    session.sql(f"TRUNCATE TABLE ROLLUP_{grp}").collect()
+# 10. Monthly behavior trends for past 24 months
+start_date = date.today() - timedelta(days=730)
+monthly_trends = (
+    order_intervals
+    .with_column("MONTH", F.date_trunc("month", F.col("SERVICEDATEOFORDER")))
+    .filter(F.col("MONTH") >= F.lit(start_date))
+    .group_by("MONTH")
+    .agg(
+        F.count_distinct("PATIENTID").alias("ACTIVE_PATIENTS"),
+        F.count("ORDERNUMBER").alias("TOTAL_ORDERS"),
+        F.avg("DAYS_AFTER_ELIGIBLE").alias("AVG_DAYS_LATE"),
+        (F.sum("ON_TIME_FLAG") / F.count("ORDERNUMBER")).alias("ON_TIME_RATE"),
+        F.sum("TOTALAMOUNT").alias("TOTAL_REVENUE")
+    )
+    .order_by("MONTH")
+)
+session.sql("TRUNCATE TABLE MONTHLY_BEHAVIOR_TRENDS").collect()
+monthly_trends.write.save_as_table("MONTHLY_BEHAVIOR_TRENDS", mode="overwrite")
 
-# 10. Write results to Snowflake tables
-#    Base tables
-df_patient_metrics.write.save_as_table("PATIENT_BEHAVIOR_METRICS", mode="overwrite")
-df_rollup_all.write.save_as_table("PATIENT_METRICS_ROLLUP", mode="overwrite")
-#    Per-group rollups
-def write_rollup(name, df):
-    df.write.save_as_table(f"ROLLUP_{name}", mode="overwrite")
-for grp, df in rollup_by.items():
-    write_rollup(grp, df)
-
-# 11. Optionally create views in Snowflake for each rollup
-for grp in groupings:
-    session.sql(f"CREATE OR REPLACE VIEW VW_ROLLUP_{grp} AS SELECT * FROM ROLLUP_{grp}").collect()
-
-# 12. Close session
+# 11. Close session
 session.close()
 ```
