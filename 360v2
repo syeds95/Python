@@ -263,3 +263,105 @@ _print_df('Monthly Behavior Trends (24m)', monthly_trends)
 _print_df('Monthly Lateness Buckets (24m)', monthly_lateness_buckets)
 _print_df('Reorder Frequency Quantiles (DAYS_BETWEEN)', qtiles.reset_index())
 _print_df('Extra Summary', extra_summary)
+
+
+
+# loader_to_snowflake.py
+import os
+import pandas as pd
+from snowflake.snowpark import Session
+
+# ---- Snowflake connection ----
+def get_session():
+    cfg = {
+        "account":   os.getenv("SNOWFLAKE_ACCOUNT"),
+        "user":      os.getenv("SNOWFLAKE_USER"),
+        "password":  os.getenv("SNOWFLAKE_PASSWORD"),
+        "role":      os.getenv("SNOWFLAKE_ROLE", "PUBLIC"),
+        "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+        "database":  os.getenv("SNOWFLAKE_DATABASE"),
+        "schema":    os.getenv("SNOWFLAKE_SCHEMA"),
+    }
+    return Session.builder.configs(cfg).create()
+
+def fq(table_name: str) -> str:
+    """Optionally return fully-qualified name if DB/SCHEMA given via env."""
+    db = os.getenv("SNOWFLAKE_DATABASE")
+    sch = os.getenv("SNOWFLAKE_SCHEMA")
+    if db and sch:
+        return f"{db}.{sch}.{table_name}"
+    return table_name
+
+# ---- Core writer using Snowpark ----
+def write_pandas_df(session: Session, df: pd.DataFrame, table_name: str, truncate_first=True):
+    tname = fq(table_name)
+
+    # If df is empty, just truncate (optional) and return
+    if df is None or df.empty:
+        if truncate_first:
+            session.sql(f"TRUNCATE TABLE {tname}").collect()
+        print(f"[INFO] {tname}: DataFrame empty; truncated and skipped write.")
+        return
+
+    # Ensure pandas-friendly dtypes for dates (Snowpark will infer)
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            # Snowflake DATE vs TIMESTAMP: if you want DATE, strip time
+            df[col] = pd.to_datetime(df[col]).dt.date
+
+    if truncate_first:
+        session.sql(f"TRUNCATE TABLE {tname}").collect()
+
+    spdf = session.create_dataframe(df)  # from pandas -> Snowpark DF
+    spdf.write.save_as_table(tname, mode="overwrite")  # overwrite keeps structure
+    print(f"[OK] Wrote {len(df):,} rows to {tname}")
+
+# ---- Convenience wrapper to write all outputs ----
+def load_all_to_snowflake(
+    patient_df: pd.DataFrame,
+    rollups: dict,  # keys: 'PATIENT_GROUP','ITEM_GROUP','INSURANCE','DAYS_LATE_BUCKET'
+    monthly_trends: pd.DataFrame,
+    monthly_lateness_buckets: pd.DataFrame,
+):
+    session = get_session()
+    try:
+        # Patient-level
+        write_pandas_df(session, patient_df.reset_index(drop=True), "PATIENT_BEHAVIOR_METRICS")
+
+        # Rollups
+        table_map = {
+            "PATIENT_GROUP":      "BEHAVIOR_BY_PATIENT_GROUP",
+            "ITEM_GROUP":         "BEHAVIOR_BY_ITEM_GROUP",
+            "INSURANCE":          "BEHAVIOR_BY_INSURANCE",
+            "DAYS_LATE_BUCKET":   "BEHAVIOR_BY_DAYS_LATE_BUCKET",
+        }
+        for k, tname in table_map.items():
+            df = rollups.get(k)
+            write_pandas_df(session, df, tname)
+
+        # Monthly trends
+        write_pandas_df(session, monthly_trends, "MONTHLY_BEHAVIOR_TRENDS")
+
+        # Monthly lateness buckets
+        write_pandas_df(session, monthly_lateness_buckets, "MONTHLY_LATENESS_BUCKET_TRENDS")
+
+    finally:
+        session.close()
+
+
+
+
+
+
+from loader_to_snowflake import load_all_to_snowflake
+
+# rollups is your dict created in the script, e.g. {'PATIENT_GROUP': df, 'ITEM_GROUP': df, ...}
+load_all_to_snowflake(
+    patient_df=patient,
+    rollups=rollups,
+    monthly_trends=monthly_trends,
+    monthly_lateness_buckets=monthly_lateness_buckets
+)
+
+
+
