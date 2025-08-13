@@ -37,12 +37,27 @@ missing = [c for c in REQUIRED_COLS if c not in my_df.columns]
 if missing:
     raise ValueError(f"my_df is missing required columns: {missing}")
 
-# Copy & type-cast
+# Copy & type-cast with STRICT YYYY-MM-DD parsing (per your data)
 _df = my_df.copy()
 _df['PATIENTID'] = _df['PATIENTID'].astype(str)
 _df['ORDERNUMBER'] = _df['ORDERNUMBER'].astype(str)
-_df['SERVICEDATEOFORDER'] = pd.to_datetime(_df['SERVICEDATEOFORDER'])
-_df['ELIGIBLETOSHIP']     = pd.to_datetime(_df['ELIGIBLETOSHIP'])
+
+# Force YYYY-MM-DD; if timeparts sneak in, keep only first 10 chars
+_df['SERVICEDATEOFORDER'] = pd.to_datetime(
+    _df['SERVICEDATEOFORDER'].astype(str).str.slice(0, 10),
+    format='%Y-%m-%d', errors='coerce'
+)
+_df['ELIGIBLETOSHIP'] = pd.to_datetime(
+    _df['ELIGIBLETOSHIP'].astype(str).str.slice(0, 10),
+    format='%Y-%m-%d', errors='coerce'
+)
+
+# Quick validation warnings
+_bad_srv = _df['SERVICEDATEOFORDER'].isna().sum()
+_bad_elig = _df['ELIGIBLETOSHIP'].isna().sum()
+if _bad_srv or _bad_elig:
+    print(f"WARNING: Unparsed dates -> SERVICEDATEOFORDER: {_bad_srv}, ELIGIBLETOSHIP: {_bad_elig}")
+
 for c in ['SUPPLYDURATION','TOTALAMOUNT','TOTALQTY']:
     _df[c] = pd.to_numeric(_df[c], errors='coerce').fillna(0)
 
