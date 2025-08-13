@@ -1,239 +1,250 @@
--- hme_key_metrics.sql
--- Complete Patient-Level & Aggregate Behavior Analysis in SQL
+# hme_key_metrics_pandas.py
+# Patient & Reordering Behavior Analysis (pandas + numpy)
+# - Input: pandas DataFrame `my_df` with columns below
+# - Output: prints dataframes to stdout (no DB writes)
+#
+# Required columns in my_df:
+#   PATIENTID (str) | ORDERNUMBER (str) | HCPCS (str)
+#   SERVICEDATEOFORDER (date/datetime) | ELIGIBLETOSHIP (date/datetime)
+#   SUPPLYDURATION (numeric days, e.g., 30 or 90)
+#   TOTALAMOUNT (numeric) | TOTALQTY (numeric)
+#   INSURANCE (str) | PATIENT_GROUP (str) | ITEM_GROUP (str)
 
--- 0. Source data: replace the query below with your own extraction logic
-WITH source_data AS (
-  -- e.g. SELECT PATIENTID, ORDERNUMBER, HCPCS, SERVICEDATEOFORDER, ELIGIBLETOSHIP,
-  --       SUPPLYDURATION, TOTALAMOUNT, TOTALQTY, INSURANCE, PATIENT_GROUP, ITEM_GROUP
-  SELECT * FROM ORDERS  -- << replace this with your source query >>
-),
+import pandas as pd
+import numpy as np
+from datetime import datetime
 
--- 1. Descriptive RFM + tenure + static attributes
---    One row per patient
-descriptive AS (
-  SELECT
-    PATIENTID,
-    MIN(SERVICEDATEOFORDER) AS FIRST_SERVICE_DATE,
-    MAX(SERVICEDATEOFORDER) AS LAST_SERVICE_DATE,
-    COUNT(DISTINCT ORDERNUMBER) AS ORDERS_TOTAL,
-    SUM(TOTALAMOUNT)          AS TOTAL_REVENUE,
-    SUM(TOTALQTY)             AS TOTAL_QTY,
-    MAX_BY(INSURANCE, SERVICEDATEOFORDER)    AS INSURANCE,
-    MAX_BY(PATIENT_GROUP, SERVICEDATEOFORDER) AS PATIENT_GROUP,
-    MAX_BY(ITEM_GROUP, SERVICEDATEOFORDER)    AS ITEM_GROUP
-  FROM source_data
-  GROUP BY PATIENTID
-),
+# -------- Helper printing config --------
+MAX_ROWS_DISPLAY = 30
 
--- 2. Order-level lag & on-time flags
-order_intervals AS (
-  SELECT
-    sd.PATIENTID,
-    sd.ORDERNUMBER,
-    sd.SERVICEDATEOFORDER,
-    LAG(sd.SERVICEDATEOFORDER) OVER (PARTITION BY sd.PATIENTID ORDER BY sd.SERVICEDATEOFORDER) AS PREV_DATE,
-    LAG(sd.ELIGIBLETOSHIP)   OVER (PARTITION BY sd.PATIENTID ORDER BY sd.SERVICEDATEOFORDER) AS PREV_ELIGIBLE,
-    sd.SUPPLYDURATION,
-    sd.TOTALAMOUNT,
-    DATEDIFF('day', LAG(sd.SERVICEDATEOFORDER) OVER (PARTITION BY sd.PATIENTID ORDER BY sd.SERVICEDATEOFORDER), sd.SERVICEDATEOFORDER) AS DAYS_BETWEEN,
-    DATEDIFF('day', LAG(sd.ELIGIBLETOSHIP)     OVER (PARTITION BY sd.PATIENTID ORDER BY sd.SERVICEDATEOFORDER), sd.SERVICEDATEOFORDER) AS DAYS_AFTER_ELIGIBLE,
-    CASE
-      WHEN DATEDIFF('day', LAG(sd.ELIGIBLETOSHIP) OVER (PARTITION BY sd.PATIENTID ORDER BY sd.SERVICEDATEOFORDER), sd.SERVICEDATEOFORDER)
-           BETWEEN 0 AND sd.SUPPLYDURATION * 0.1
-      THEN 1
-      ELSE 0
-    END AS ON_TIME_FLAG
-  FROM source_data sd
-),
+def _print_df(title: str, df: pd.DataFrame, max_rows: int = MAX_ROWS_DISPLAY):
+    print(f"\n\n=== {title} ===")
+    if df is None:
+        print("<empty>")
+        return
+    if len(df) > max_rows:
+        print(df.head(max_rows).to_string(index=False))
+        print(f"... ({len(df) - max_rows} more rows not shown)")
+    else:
+        print(df.to_string(index=False))
 
--- 3. Aggregate order-level metrics per patient
-order_metrics AS (
-  SELECT
-    PATIENTID,
-    AVG(DAYS_BETWEEN)                                                                 AS AVG_DAYS_BETWEEN,
-    AVG(CASE WHEN DAYS_AFTER_ELIGIBLE > 0 THEN DAYS_AFTER_ELIGIBLE ELSE NULL END)        AS AVG_DAYS_LATE,
-    SUM(ON_TIME_FLAG)                                                                 AS ON_TIME_ORDERS,
-    COUNT(ORDERNUMBER)                                                                AS TOTAL_ORDERS,
-    SUM(TOTALAMOUNT)                                                                  AS REVENUE_ORDERS
-  FROM order_intervals
-  WHERE PREV_DATE IS NOT NULL
-  GROUP BY PATIENTID
-),
+# -------- Validate & normalize input --------
+REQUIRED_COLS = [
+    'PATIENTID','ORDERNUMBER','HCPCS','SERVICEDATEOFORDER','ELIGIBLETOSHIP',
+    'SUPPLYDURATION','TOTALAMOUNT','TOTALQTY','INSURANCE','PATIENT_GROUP','ITEM_GROUP'
+]
+missing = [c for c in REQUIRED_COLS if c not in my_df.columns]
+if missing:
+    raise ValueError(f"my_df is missing required columns: {missing}")
 
--- 4. Churn flag (1 = churned)
-last_supply AS (
-  SELECT PATIENTID, MAX(SUPPLYDURATION) AS LAST_SUPPLY_DURATION
-  FROM source_data
-  GROUP BY PATIENTID
-),
-churn AS (
-  SELECT
-    d.PATIENTID,
-    CASE WHEN DATEDIFF('day', d.LAST_SERVICE_DATE, CURRENT_DATE()) > ls.LAST_SUPPLY_DURATION * 1.1
-         THEN 1 ELSE 0 END AS CHURN_FLAG
-  FROM descriptive d
-  LEFT JOIN last_supply ls USING(PATIENTID)
-),
+# Copy & type-cast
+_df = my_df.copy()
+_df['PATIENTID'] = _df['PATIENTID'].astype(str)
+_df['ORDERNUMBER'] = _df['ORDERNUMBER'].astype(str)
+_df['SERVICEDATEOFORDER'] = pd.to_datetime(_df['SERVICEDATEOFORDER'])
+_df['ELIGIBLETOSHIP']     = pd.to_datetime(_df['ELIGIBLETOSHIP'])
+for c in ['SUPPLYDURATION','TOTALAMOUNT','TOTALQTY']:
+    _df[c] = pd.to_numeric(_df[c], errors='coerce').fillna(0)
 
--- 5. Time to first reorder using ROW_NUMBER instead of DENSE_RANK
-second_order AS (
-  SELECT PATIENTID, SERVICEDATEOFORDER AS SECOND_DATE
-  FROM (
-    SELECT
-      PATIENTID,
-      SERVICEDATEOFORDER,
-      ROW_NUMBER() OVER (PARTITION BY PATIENTID ORDER BY SERVICEDATEOFORDER) AS rn
-    FROM source_data
-  ) sub
-  WHERE rn = 2
-),
+TODAY = pd.to_datetime(datetime.today().date())
 
--- 6. Calculate days to first reorder
-time_to_first AS (
-  SELECT
-    d.PATIENTID,
-    DATEDIFF('day', d.FIRST_SERVICE_DATE, so.SECOND_DATE) AS TIME_TO_FIRST_REORDER
-  FROM descriptive d
-  LEFT JOIN second_order so USING(PATIENTID)
-), LTV curves
-ltv_prep AS (
-  SELECT
-    sd.PATIENTID,
-    sd.SERVICEDATEOFORDER,
-    sd.TOTALAMOUNT,
-    d.FIRST_SERVICE_DATE
-  FROM source_data sd
-  JOIN descriptive d USING(PATIENTID)
-),
-ltv AS (
-  SELECT
-    PATIENTID,
-    SUM(CASE WHEN DATEDIFF('day', FIRST_SERVICE_DATE, SERVICEDATEOFORDER) <=  30 THEN TOTALAMOUNT ELSE 0 END) AS LTV_30d,
-    SUM(CASE WHEN DATEDIFF('day', FIRST_SERVICE_DATE, SERVICEDATEOFORDER) <=  60 THEN TOTALAMOUNT ELSE 0 END) AS LTV_60d,
-    SUM(CASE WHEN DATEDIFF('day', FIRST_SERVICE_DATE, SERVICEDATEOFORDER) <=  90 THEN TOTALAMOUNT ELSE 0 END) AS LTV_90d,
-    SUM(CASE WHEN DATEDIFF('day', FIRST_SERVICE_DATE, SERVICEDATEOFORDER) <= 180 THEN TOTALAMOUNT ELSE 0 END) AS LTV_180d,
-    SUM(CASE WHEN DATEDIFF('day', FIRST_SERVICE_DATE, SERVICEDATEOFORDER) <= 365 THEN TOTALAMOUNT ELSE 0 END) AS LTV_365d
-  FROM ltv_prep
-  GROUP BY PATIENTID
-),
-
--- 7. Basket composition
-distinct_items AS (
-  SELECT PATIENTID, COUNT(DISTINCT HCPCS) AS UNIQUE_HCPCS
-  FROM source_data
-  GROUP BY PATIENTID
-),
-
--- 8. Seasonality
-distinct_months AS (
-  SELECT
-    PATIENTID,
-    COUNT(DISTINCT DATE_TRUNC('month', SERVICEDATEOFORDER)) AS ACTIVE_MONTHS
-  FROM source_data
-  GROUP BY PATIENTID
-),
-
--- 9. Assemble full patient metrics
-patient_metrics AS (
-  SELECT
-    d.PATIENTID,
-    d.INSURANCE,
-    d.PATIENT_GROUP,
-    d.ITEM_GROUP,
-    d.FIRST_SERVICE_DATE,
-    d.LAST_SERVICE_DATE,
-    DATEDIFF('day', d.FIRST_SERVICE_DATE, CURRENT_DATE()) AS TENURE_DAYS,
-    DATEDIFF('day', d.LAST_SERVICE_DATE,  CURRENT_DATE()) AS RECENCY_DAYS,
-    d.ORDERS_TOTAL,
-    d.TOTAL_REVENUE,
-    d.TOTAL_QTY,
-    om.AVG_DAYS_BETWEEN,
-    om.AVG_DAYS_LATE,
-    om.ON_TIME_ORDERS,
-    om.TOTAL_ORDERS,
-    om.REVENUE_ORDERS,
-    CASE WHEN om.TOTAL_ORDERS > 0 THEN om.ON_TIME_ORDERS::DOUBLE / om.TOTAL_ORDERS ELSE 0 END AS ON_TIME_RATE,
-    c.CHURN_FLAG,
-    tf.TIME_TO_FIRST_REORDER,
-    l.LTV_30d, l.LTV_60d, l.LTV_90d, l.LTV_180d, l.LTV_365d,
-    di.UNIQUE_HCPCS,
-    dm.ACTIVE_MONTHS
-  FROM descriptive d
-  LEFT JOIN order_metrics om USING(PATIENTID)
-  LEFT JOIN churn c           USING(PATIENTID)
-  LEFT JOIN time_to_first tf  USING(PATIENTID)
-  LEFT JOIN ltv l             USING(PATIENTID)
-  LEFT JOIN distinct_items di USING(PATIENTID)
-  LEFT JOIN distinct_months dm USING(PATIENTID)
+# -------- 1) Descriptive per-patient (RFM, tenure/recency) --------
+# Static attrs from most recent row per patient
+_last_row = (
+    _df.sort_values(['PATIENTID','SERVICEDATEOFORDER'])
+       .groupby('PATIENTID', as_index=False)
+       .tail(1)
+       .set_index('PATIENTID')
+       [['INSURANCE','PATIENT_GROUP','ITEM_GROUP']]
 )
 
--- 10. Create patient behavior metrics table
-CREATE OR REPLACE TABLE PATIENT_BEHAVIOR_METRICS AS
-SELECT
-  *,
-  CASE
-    WHEN AVG_DAYS_LATE <=  3 THEN '0-3 days late'
-    WHEN AVG_DAYS_LATE <=  7 THEN '4-7 days late'
-    WHEN AVG_DAYS_LATE <= 14 THEN '8-14 days late'
-    WHEN AVG_DAYS_LATE <= 30 THEN '15-30 days late'
-    WHEN AVG_DAYS_LATE <= 60 THEN '31-60 days late'
-    WHEN AVG_DAYS_LATE <= 90 THEN '61-90 days late'
-    ELSE '>90 days late'
-  END AS DAYS_LATE_BUCKET
-FROM patient_metrics;
-
--- 11. Monthly behavior trends (last 24 months)
-WITH order_intervals_month AS (
-  SELECT
-    sd.*,
-    LAG(sd.ELIGIBLETOSHIP) OVER (PARTITION BY sd.PATIENTID ORDER BY sd.SERVICEDATEOFORDER) AS PREV_ELIGIBLE
-  FROM source_data sd
+_desc = (
+    _df.groupby('PATIENTID').agg(
+        FIRST_SERVICE_DATE=('SERVICEDATEOFORDER','min'),
+        LAST_SERVICE_DATE =('SERVICEDATEOFORDER','max'),
+        ORDERS_TOTAL      =('ORDERNUMBER','nunique'),
+        TOTAL_REVENUE     =('TOTALAMOUNT','sum'),
+        TOTAL_QTY         =('TOTALQTY','sum')
+    ).join(_last_row, how='left')
 )
-CREATE OR REPLACE TABLE MONTHLY_BEHAVIOR_TRENDS AS
-SELECT
-  DATE_TRUNC('month', o.SERVICEDATEOFORDER) AS MONTH,
-  COUNT(DISTINCT o.PATIENTID) AS ACTIVE_PATIENTS,
-  COUNT(o.ORDERNUMBER)        AS TOTAL_ORDERS,
-  AVG(DATEDIFF('day', om.PREV_ELIGIBLE, o.SERVICEDATEOFORDER)) AS AVG_DAYS_LATE,
-  SUM(CASE WHEN DATEDIFF('day', om.PREV_ELIGIBLE, o.SERVICEDATEOFORDER) BETWEEN 0 AND o.SUPPLYDURATION*0.1
-           THEN 1 ELSE 0 END)::DOUBLE / COUNT(*) AS ON_TIME_RATE,
-  SUM(o.TOTALAMOUNT)          AS TOTAL_REVENUE
-FROM order_intervals_month om
-JOIN source_data o USING(ORDERNUMBER)
-WHERE o.SERVICEDATEOFORDER >= DATEADD(month, -24, CURRENT_DATE())
-GROUP BY 1
-ORDER BY 1;
+_desc['TENURE_DAYS']  = (TODAY - _desc['FIRST_SERVICE_DATE']).dt.days
+_desc['RECENCY_DAYS'] = (TODAY - _desc['LAST_SERVICE_DATE']).dt.days
 
--- 12. Monthly lateness bucket trends with expanded ranges
-WITH order_intervals_month AS (
-  SELECT
-    sd.*,
-    LAG(sd.ELIGIBLETOSHIP) OVER (PARTITION BY sd.PATIENTID ORDER BY sd.SERVICEDATEOFORDER) AS PREV_ELIGIBLE
-  FROM source_data sd
-), bucketed AS (
-  SELECT
-    DATE_TRUNC('month', o.SERVICEDATEOFORDER) AS MONTH,
-    CASE
-      WHEN DATEDIFF('day', prev.PREV_ELIGIBLE, o.SERVICEDATEOFORDER) <=  3  THEN '0-3 days late'
-      WHEN DATEDIFF('day', prev.PREV_ELIGIBLE, o.SERVICEDATEOFORDER) <=  5  THEN '4-5 days late'
-      WHEN DATEDIFF('day', prev.PREV_ELIGIBLE, o.SERVICEDATEOFORDER) <= 15  THEN '6-15 days late'
-      WHEN DATEDIFF('day', prev.PREV_ELIGIBLE, o.SERVICEDATEOFORDER) <= 30  THEN '16-30 days late'
-      WHEN DATEDIFF('day', prev.PREV_ELIGIBLE, o.SERVICEDATEOFORDER) <= 45  THEN '31-45 days late'
-      WHEN DATEDIFF('day', prev.PREV_ELIGIBLE, o.SERVICEDATEOFORDER) <= 60  THEN '46-60 days late'
-      WHEN DATEDIFF('day', prev.PREV_ELIGIBLE, o.SERVICEDATEOFORDER) <= 90  THEN '61-90 days late'
-      WHEN DATEDIFF('day', prev.PREV_ELIGIBLE, o.SERVICEDATEOFORDER) <= 120 THEN '91-120 days late'
-      ELSE '>120 days late'
-    END AS LATE_BUCKET,
-    o.PATIENTID
-  FROM order_intervals_month prev
-  JOIN source_data o USING(ORDERNUMBER)
-  WHERE o.SERVICEDATEOFORDER >= DATEADD(month, -24, CURRENT_DATE())
+# -------- 2) Order-level metrics (dedupe to true order records) --------
+# Build one row per ORDERNUMBER (aggregate revenue across HCPCS lines)
+_orders = (
+    _df.sort_values(['PATIENTID','SERVICEDATEOFORDER'])
+       .groupby('ORDERNUMBER', as_index=False)
+       .agg(
+           PATIENTID=('PATIENTID','first'),
+           SERVICEDATEOFORDER=('SERVICEDATEOFORDER','first'),
+           ELIGIBLETOSHIP=('ELIGIBLETOSHIP','first'),
+           SUPPLYDURATION=('SUPPLYDURATION','first'),
+           ORDER_REVENUE=('TOTALAMOUNT','sum')
+       )
 )
-CREATE OR REPLACE TABLE MONTHLY_LATENESS_BUCKET_TRENDS AS
-SELECT
-  MONTH,
-  LATE_BUCKET,
-  COUNT(DISTINCT PATIENTID) AS PATIENT_COUNT
-FROM bucketed
-GROUP BY MONTH, LATE_BUCKET
-ORDER BY MONTH, LATE_BUCKET;
+# Lag by patient to compute inter-order gaps
+_orders = _orders.sort_values(['PATIENTID','SERVICEDATEOFORDER'])
+_orders[['PREV_DATE','PREV_ELIGIBLE']] = (
+    _orders.groupby('PATIENTID')[['SERVICEDATEOFORDER','ELIGIBLETOSHIP']].shift(1)
+)
+# Keep only orders with a previous one
+_orders_int = _orders.dropna(subset=['PREV_DATE','PREV_ELIGIBLE']).copy()
+_orders_int['DAYS_BETWEEN']       = (_orders_int['SERVICEDATEOFORDER'] - _orders_int['PREV_DATE']).dt.days
+_orders_int['DAYS_AFTER_ELIGIBLE'] = (_orders_int['SERVICEDATEOFORDER'] - _orders_int['PREV_ELIGIBLE']).dt.days
+_orders_int['ON_TIME_FLAG'] = np.where(
+    (_orders_int['DAYS_AFTER_ELIGIBLE'] >= 0) &
+    (_orders_int['DAYS_AFTER_ELIGIBLE'] <= _orders_int['SUPPLYDURATION']*0.10), 1, 0
+)
+
+# -------- 3) Patient-level aggregation from order intervals --------
+_ord_metrics = _orders_int.groupby('PATIENTID').agg(
+    AVG_DAYS_BETWEEN=('DAYS_BETWEEN','mean'),
+    AVG_DAYS_LATE=('DAYS_AFTER_ELIGIBLE', lambda s: s[s>0].mean() if (s>0).any() else 0.0),
+    ON_TIME_ORDERS=('ON_TIME_FLAG','sum'),
+    TOTAL_ORDERS   =('ORDERNUMBER','count'),  # counts only orders AFTER the first
+    REVENUE_ORDERS=('ORDER_REVENUE','sum')
+)
+
+# -------- 4) Churn flag (recency vs last supply duration *1.1) --------
+_last_supply = (
+    _orders.groupby('PATIENTID')['SUPPLYDURATION'].max().rename('LAST_SUPPLY_DURATION')
+)
+_churn = _desc.join(_last_supply, how='left')
+_churn['CHURN_FLAG'] = np.where(
+    _churn['RECENCY_DAYS'] > _churn['LAST_SUPPLY_DURATION']*1.10, 1, 0
+)
+
+# -------- 5) Time to first reorder --------
+_first_two = (
+    _orders.sort_values(['PATIENTID','SERVICEDATEOFORDER'])
+           .groupby('PATIENTID')['SERVICEDATEOFORDER']
+)
+_second_dates = _first_two.nth(1)  # zero-based -> second order is index 1
+_time_to_first = (_second_dates.to_frame('SECOND_DATE')
+                  .join(_desc[['FIRST_SERVICE_DATE']], how='right'))
+_time_to_first['TIME_TO_FIRST_REORDER'] = (
+    (_time_to_first['SECOND_DATE'] - _time_to_first['FIRST_SERVICE_DATE']).dt.days
+)
+
+# -------- 6) LTV curves at 30/60/90/180/365 days --------
+_orders_w_first = _orders.merge(
+    _desc[['FIRST_SERVICE_DATE']], left_on='PATIENTID', right_index=True, how='left'
+)
+_orders_w_first['DAYS_SINCE_FIRST'] = (
+    _orders_w_first['SERVICEDATEOFORDER'] - _orders_w_first['FIRST_SERVICE_DATE']
+).dt.days
+ltv_thresholds = [30,60,90,180,365]
+for d in ltv_thresholds:
+    _orders_w_first[f'LTV_{d}d_PART'] = np.where(
+        _orders_w_first['DAYS_SINCE_FIRST'] <= d, _orders_w_first['ORDER_REVENUE'], 0
+    )
+_ltv = _orders_w_first.groupby('PATIENTID')[[f'LTV_{d}d_PART' for d in ltv_thresholds]].sum()
+_ltv.columns = [c.replace('_PART','') for c in _ltv.columns]
+
+# -------- 7) Basket composition & seasonality --------
+_unique_hcpcs = _df.groupby('PATIENTID')['HCPCS'].nunique().rename('UNIQUE_HCPCS')
+_active_months = (
+    _df.assign(MONTH=_df['SERVICEDATEOFORDER'].dt.to_period('M'))
+       .groupby('PATIENTID')['MONTH']
+       .nunique()
+       .rename('ACTIVE_MONTHS')
+)
+
+# -------- 8) Assemble patient-level dataset --------
+patient = (
+    _desc
+    .join(_ord_metrics, how='left')
+    .join(_churn[['CHURN_FLAG']], how='left')
+    .join(_time_to_first[['TIME_TO_FIRST_REORDER']], how='left')
+    .join(_ltv, how='left')
+    .join(_unique_hcpcs, how='left')
+    .join(_active_months, how='left')
+)
+patient['ON_TIME_RATE'] = np.where(
+    patient['TOTAL_ORDERS'].fillna(0) > 0,
+    patient['ON_TIME_ORDERS'].fillna(0) / patient['TOTAL_ORDERS'].replace(0,np.nan),
+    0
+).fillna(0)
+
+# Detailed lateness buckets (patient-level average lateness)
+patient['DAYS_LATE_BUCKET'] = pd.cut(
+    patient['AVG_DAYS_LATE'].fillna(0),
+    bins=[-1,3,7,14,30,60,90,np.inf],
+    labels=["0-3","4-7","8-14","15-30","31-60","61-90",">90"],
+    right=True
+)
+
+# -------- 9) Group rollups --------
+rollups = {}
+for grp in ['PATIENT_GROUP','ITEM_GROUP','INSURANCE','DAYS_LATE_BUCKET']:
+    tmp = (
+        patient.reset_index().groupby(grp).agg(
+            AVG_TENURE_DAYS=('TENURE_DAYS','mean'),
+            AVG_RECENCY_DAYS=('RECENCY_DAYS','mean'),
+            AVG_FREQ_PER_PATIENT=('ORDERS_TOTAL','mean'),
+            AVG_REV_PER_PATIENT=('TOTAL_REVENUE','mean'),
+            AVG_DAYS_BETWEEN_ORDERS=('AVG_DAYS_BETWEEN','mean'),
+            AVG_DAYS_LATE=('AVG_DAYS_LATE','mean'),
+            AVG_ON_TIME_RATE=('ON_TIME_RATE','mean'),
+            PATIENT_COUNT=('PATIENTID','count')
+        ).sort_values('PATIENT_COUNT', ascending=False).reset_index()
+    )
+    rollups[grp] = tmp
+
+# -------- 10) Monthly trends (last 24 months) --------
+_orders_int['MONTH'] = _orders_int['SERVICEDATEOFORDER'].dt.to_period('M').dt.to_timestamp()
+cutoff = (TODAY - pd.DateOffset(months=24)).to_period('M').to_timestamp()
+_m = _orders_int[_orders_int['MONTH'] >= cutoff].copy()
+monthly_trends = (
+    _m.groupby('MONTH').agg(
+        ACTIVE_PATIENTS=('PATIENTID', 'nunique'),
+        TOTAL_ORDERS   =('ORDERNUMBER','count'),
+        AVG_DAYS_LATE  =('DAYS_AFTER_ELIGIBLE','mean'),
+        ON_TIME_RATE   =('ON_TIME_FLAG', lambda s: s.sum()/len(s) if len(s)>0 else 0),
+        TOTAL_REVENUE  =('ORDER_REVENUE','sum')
+    ).reset_index().sort_values('MONTH')
+)
+monthly_trends['AOV'] = np.where(
+    monthly_trends['TOTAL_ORDERS']>0,
+    monthly_trends['TOTAL_REVENUE']/monthly_trends['TOTAL_ORDERS'], 0
+)
+
+# Monthly lateness buckets (expanded ranges for per-order lateness)
+_bucket_edges = [0,3,5,15,30,45,60,90,120,10**9]
+_bucket_labels = [
+    '0-3','4-5','6-15','16-30','31-45','46-60','61-90','91-120','>120'
+]
+_m['BUCKET'] = pd.cut(
+    _m['DAYS_AFTER_ELIGIBLE'].clip(lower=0),
+    bins=_bucket_edges, labels=_bucket_labels, right=True, include_lowest=True
+)
+monthly_lateness_buckets = (
+    _m.groupby(['MONTH','BUCKET'])['PATIENTID']
+      .nunique()
+      .rename('PATIENT_COUNT')
+      .reset_index()
+      .sort_values(['MONTH','BUCKET'])
+)
+
+# -------- 11) Extra behavior insights --------
+# Reorder frequency distribution (across orders with prev)
+qtiles = _orders_int['DAYS_BETWEEN'].dropna().quantile([0.10,0.25,0.50,0.75,0.90]).rename_axis('quantile').to_frame('days')
+# Early reorder behavior (negative lateness)
+early = _orders_int[_orders_int['DAYS_AFTER_ELIGIBLE'] < 0]
+extra_summary = pd.DataFrame({
+    'TOTAL_PATIENTS':[len(patient)],
+    'TOTAL_DISTINCT_ORDERS':[ _orders['ORDERNUMBER'].nunique() ],
+    'ORDERS_WITH_PREV':[ len(_orders_int) ],
+    'EARLY_ORDERS_COUNT':[ len(early) ],
+    'AVG_EARLY_DAYS':[ early['DAYS_AFTER_ELIGIBLE'].mean() if len(early)>0 else 0 ]
+})
+
+# -------- 12) Print all results --------
+_print_df('Patient-Level Metrics (first rows)', patient.reset_index())
+for k,dfx in rollups.items():
+    _print_df(f'Rollup by {k}', dfx)
+_print_df('Monthly Behavior Trends (24m)', monthly_trends)
+_print_df('Monthly Lateness Buckets (24m)', monthly_lateness_buckets)
+_print_df('Reorder Frequency Quantiles (DAYS_BETWEEN)', qtiles.reset_index())
+_print_df('Extra Summary', extra_summary)
