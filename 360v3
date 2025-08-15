@@ -1,7 +1,7 @@
 /* ===========================================================
    ONE SCRIPT: Build & Load ORDERS_TABLE from your SELECT
    - Full refresh (CREATE OR REPLACE)
-   - Normalizes types, parses dates, light de-dupe
+   - Normalizes types, parses dates (string-safe), light de-dupe
    - Standardizes channel (DTC/LINK) and product (Ostomy/Urology)
    - Creates helper views: ORDER_HEADER, ORDER_ITEMS
    =========================================================== */
@@ -14,13 +14,11 @@ USE SCHEMA        <YOUR_SCHEMA>;
 
 /* ---- 2) CREATE OR REPLACE TARGET TABLE VIA CTAS ----
    Replace the SOURCE SELECT in raw_source with your current query.
-   Keep the column aliases/names identical to those shown below.
 ---------------------------------------------------------------- */
 CREATE OR REPLACE TABLE ORDERS_TABLE AS
 WITH raw_source AS (
   /* >>>>>>>>>>>>>>>>>>  PUT YOUR EXISTING SELECT HERE  <<<<<<<<<<<<<<<<<<
      It must output these columns (any data types; strings OK).
-     Example shape:
 
      SELECT
        PatientID,
@@ -60,20 +58,20 @@ norm AS (
     TRIM(CAST(OrderNumber AS VARCHAR))                            AS OrderNumber,
     UPPER(TRIM(CAST(HCPCS AS VARCHAR)))                           AS HCPCS,
 
-    /* Dates (flexible parsing) */
+    /* Dates — robust for DATE/TIMESTAMP/STRING inputs */
     COALESCE(
       TRY_TO_DATE(ServiceDateOfOrder),
-      TRY_TO_DATE(ServiceDateOfOrder, 'YYYY-MM-DD'),
-      TRY_TO_DATE(ServiceDateOfOrder, 'YYYY/MM/DD'),
-      TRY_TO_DATE(ServiceDateOfOrder, 'MM/DD/YYYY'),
-      TRY_TO_DATE(ServiceDateOfOrder, 'YYYYMMDD'),
-      TRY_TO_DATE(ServiceDateOfOrder, 'DD-MON-YYYY')
+      TRY_TO_DATE(TO_VARCHAR(ServiceDateOfOrder), 'YYYY-MM-DD'),
+      TRY_TO_DATE(TO_VARCHAR(ServiceDateOfOrder), 'YYYY/MM/DD'),
+      TRY_TO_DATE(TO_VARCHAR(ServiceDateOfOrder), 'MM/DD/YYYY'),
+      TRY_TO_DATE(TO_VARCHAR(ServiceDateOfOrder), 'YYYYMMDD'),
+      TRY_TO_DATE(TO_VARCHAR(ServiceDateOfOrder), 'DD-MON-YYYY')
     )                                                             AS ServiceDateOfOrder,
 
     /* Amounts / quantities */
-    TRY_TO_DECIMAL(REGEXP_REPLACE(CAST(TotalAmount AS VARCHAR), '[^0-9\\.-]', ''), 38, 2) AS TotalAmount,
-    TRY_TO_NUMBER (REGEXP_REPLACE(CAST(TotalQTY    AS VARCHAR), '[^0-9\\.-]', ''))        AS TotalQTY,
-    TRY_TO_NUMBER (REGEXP_REPLACE(CAST(SupplyDuration AS VARCHAR), '[^0-9\\.-]', ''))     AS SupplyDuration,
+    TRY_TO_DECIMAL(REGEXP_REPLACE(CAST(TotalAmount AS VARCHAR), '[^0-9.-]', ''), 38, 2) AS TotalAmount,
+    TRY_TO_NUMBER (REGEXP_REPLACE(CAST(TotalQTY    AS VARCHAR), '[^0-9.-]', ''))        AS TotalQTY,
+    TRY_TO_NUMBER (REGEXP_REPLACE(CAST(SupplyDuration AS VARCHAR), '[^0-9.-]', ''))     AS SupplyDuration,
 
     /* Insurance */
     NULLIF(TRIM(CAST(InsuranceName AS VARCHAR)), '')             AS InsuranceName,
@@ -96,23 +94,19 @@ norm AS (
       ELSE INITCAP(NULLIF(TRIM(CAST(Item_Group AS VARCHAR)), ''))
     END                                                          AS Item_Group,
 
-    /* Next eligible to ship (order-level; may be present on only one line in source) */
+    /* Next eligible to ship — same fix (string-safe) */
     COALESCE(
       TRY_TO_DATE(NextEligibleToShipDate),
-      TRY_TO_DATE(NextEligibleToShipDate, 'YYYY-MM-DD'),
-      TRY_TO_DATE(NextEligibleToShipDate, 'YYYY/MM/DD'),
-      TRY_TO_DATE(NextEligibleToShipDate, 'MM/DD/YYYY'),
-      TRY_TO_DATE(NextEligibleToShipDate, 'YYYYMMDD'),
-      TRY_TO_DATE(NextEligibleToShipDate, 'DD-MON-YYYY')
+      TRY_TO_DATE(TO_VARCHAR(NextEligibleToShipDate), 'YYYY-MM-DD'),
+      TRY_TO_DATE(TO_VARCHAR(NextEligibleToShipDate), 'YYYY/MM/DD'),
+      TRY_TO_DATE(TO_VARCHAR(NextEligibleToShipDate), 'MM/DD/YYYY'),
+      TRY_TO_DATE(TO_VARCHAR(NextEligibleToShipDate), 'YYYYMMDD'),
+      TRY_TO_DATE(TO_VARCHAR(NextEligibleToShipDate), 'DD-MON-YYYY')
     )                                                             AS NextEligibleToShipDate
   FROM raw_source
 ),
 
-/* ---- 4) LIGHT DEDUPE ----------------------------------------------
-   If the source contains duplicate lines for the same natural key
-   (PatientID, OrderNumber, HCPCS, ServiceDateOfOrder), keep the row
-   with a non-null NextEligibleToShipDate; tie-break by larger amount/qty.
--------------------------------------------------------------------- */
+/* ---- 4) LIGHT DEDUPE ---------------------------------------------- */
 dedup AS (
   SELECT
     n.*,
@@ -144,39 +138,35 @@ FROM dedup
 WHERE rn = 1
 ;
 
-/* ---- 6) METADATA (optional but helpful) -------------------------- */
+/* ---- 6) METADATA (optional) -------------------------------------- */
 COMMENT ON TABLE ORDERS_TABLE IS
   'Line-level orders for HME: normalized types and standardized Channel/Product. NextEligibleToShipDate is order-level in the source.';
 
-/* ---- 7) OPTIONAL INDEXING (Search Optimization) ------------------ */
-/* Uncomment if you have large data & many equality filters on these fields
+/* ---- 7) OPTIONAL SEARCH OPTIMIZATION ----------------------------- */
+/*
 ALTER TABLE ORDERS_TABLE ADD SEARCH OPTIMIZATION ON EQUALITY(
   PatientID, OrderNumber, ServiceDateOfOrder, NextEligibleToShipDate, Item_Group, Patient_Group
 );
 */
 
-/* ---- 8) HELPER VIEWS FOR ANALYSIS/FORECAST QUERIES -------------- */
-/* View: order header with one eligibility per order */
+/* ---- 8) HELPER VIEWS FOR ANALYSIS -------------------------------- */
 CREATE OR REPLACE VIEW ORDER_HEADER AS
 SELECT
   OrderNumber,
   MAX(ServiceDateOfOrder)   AS order_date,
   MAX(NextEligibleToShipDate) AS header_next_elig,
   MAX(PatientID)            AS PatientID,
-  MAX(Patient_Group)        AS channel,       -- DTC / LINK
+  MAX(Patient_Group)        AS channel,
   MAX(InsuranceName)        AS InsuranceName
 FROM ORDERS_TABLE
 GROUP BY OrderNumber;
 
-/* View: items (simply exposes the normalized lines) */
 CREATE OR REPLACE VIEW ORDER_ITEMS AS
 SELECT * FROM ORDERS_TABLE;
 
 /* ---- 9) QUICK SANITY CHECKS ------------------------------------- */
--- Row count
 SELECT 'ORDERS_TABLE rows' AS metric, COUNT(*) AS value FROM ORDERS_TABLE;
 
--- Nulls on critical keys
 SELECT
   SUM(CASE WHEN PatientID IS NULL THEN 1 ELSE 0 END)        AS null_patientid,
   SUM(CASE WHEN OrderNumber IS NULL THEN 1 ELSE 0 END)      AS null_ordernumber,
@@ -187,3 +177,18 @@ FROM ORDERS_TABLE;
 
 
 
+
+
+WITH s AS (
+  /* your current SELECT here */
+  SELECT
+    ServiceDateOfOrder,
+    NextEligibleToShipDate
+  FROM SOURCE_DB.SCHEMA.SOURCE_TABLE_OR_VIEW
+)
+SELECT
+  SYSTEM$TYPEOF(ServiceDateOfOrder)   AS sdo_type,
+  SYSTEM$TYPEOF(NextEligibleToShipDate) AS elig_type,
+  COUNT(*) AS rows_
+FROM s
+GROUP BY 1,2;
