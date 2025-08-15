@@ -1,71 +1,85 @@
--- Monthly NEW / REPEAT / REACTIVATED per channel × product
-DECLARE @REACTIVATION_DAYS INT = 120; -- adjust if you prefer
-
-WITH base AS (
-  SELECT
-    DEDUPEID, ORG_ORDERNUMBER, HCPCS,
-    TRY_CONVERT(date, SERVICEDATE) AS order_date,
-    TRY_CONVERT(decimal(18,2), AMOUNT) AS amount,
-    PRODUCTGROUP, PATIENTCATEGORY
-  FROM TABLEABC
-),
 order_semantics AS (
-  SELECT ORG_ORDERNUMBER,
-         COUNT(*) AS rows_in_order,
-         MIN(amount) AS min_amt,
-         MAX(amount) AS max_amt
-  FROM base
-  GROUP BY ORG_ORDERNUMBER
+    SELECT
+        ORG_ORDERNUMBER,
+        COUNT(*)           AS rows_in_order,
+        MIN(amount)        AS min_amt,
+        MAX(amount)        AS max_amt
+    FROM base
+    GROUP BY ORG_ORDERNUMBER
 ),
-robust_lines AS (
-  SELECT
-    b.DEDUPEID, b.ORG_ORDERNUMBER, b.order_date,
-    b.PRODUCTGROUP, b.PATIENTCATEGORY,
-    CASE WHEN os.rows_in_order > 1 AND os.min_amt = os.max_amt
-         THEN b.amount / NULLIF(os.rows_in_order, 0) ELSE b.amount END AS line_rev
-  FROM base b
-  JOIN order_semantics os ON os.ORG_ORDERNUMBER = b.ORG_ORDERNUMBER
+-- Collapse to one row per customer × product × channel × order (protects against repeated order totals on lines)
+events AS (
+    SELECT
+        b.DEDUPEID,
+        b.PRODUCTGROUP,
+        b.PATIENTCATEGORY,
+        b.ORG_ORDERNUMBER,
+        b.order_date,
+        SUM(CASE WHEN os.rows_in_order > 1 AND os.min_amt = os.max_amt
+                 THEN b.amount / NULLIF(os.rows_in_order, 0) ELSE b.amount END) AS event_revenue
+    FROM base b
+    JOIN order_semantics os ON os.ORG_ORDERNUMBER = b.ORG_ORDERNUMBER
+    GROUP BY b.DEDUPEID, b.PRODUCTGROUP, b.PATIENTCATEGORY, b.ORG_ORDERNUMBER, b.order_date
 ),
-events AS (  -- one row per patient × product × channel × order
-  SELECT
-    rl.DEDUPEID, rl.PRODUCTGROUP, rl.PATIENTCATEGORY,
-    rl.ORG_ORDERNUMBER, rl.order_date,
-    SUM(rl.line_rev) AS event_revenue
-  FROM robust_lines rl
-  GROUP BY rl.DEDUPEID, rl.PRODUCTGROUP, rl.PATIENTCATEGORY, rl.ORG_ORDERNUMBER, rl.order_date
-),
+-- Add prior order date to classify the event
 seq AS (
-  SELECT
-    e.*,
-    LAG(e.order_date) OVER (PARTITION BY e.DEDUPEID, e.PRODUCTGROUP, e.PATIENTCATEGORY
-                            ORDER BY e.order_date) AS prev_order_date
-  FROM events e
+    SELECT
+        e.*,
+        LAG(e.order_date) OVER (
+            PARTITION BY e.DEDUPEID, e.PRODUCTGROUP, e.PATIENTCATEGORY
+            ORDER BY e.order_date
+        ) AS prev_order_date
+    FROM events e
 ),
+-- Event-level flags + month key + first-event-in-month marker (for distinct-patient counts)
 flags AS (
-  SELECT
-    DATEFROMPARTS(YEAR(order_date), MONTH(order_date), 1) AS order_month,
-    PATIENTCATEGORY, PRODUCTGROUP,
-    CASE WHEN prev_order_date IS NULL THEN 1 ELSE 0 END AS is_new,
-    CASE WHEN prev_order_date IS NOT NULL THEN 1 ELSE 0 END AS is_repeat,
-    CASE WHEN prev_order_date IS NOT NULL
-              AND DATEDIFF(day, prev_order_date, order_date) >= @REACTIVATION_DAYS
-         THEN 1 ELSE 0 END AS is_reactivated
-  FROM seq
+    SELECT
+        DATEFROMPARTS(YEAR(order_date), MONTH(order_date), 1) AS order_month,
+        PATIENTCATEGORY,
+        PRODUCTGROUP,
+        DEDUPEID,
+        order_date,
+        CASE WHEN prev_order_date IS NULL THEN 1 ELSE 0 END AS is_new,
+        CASE WHEN prev_order_date IS NOT NULL THEN 1 ELSE 0 END AS is_repeat,
+        CASE WHEN prev_order_date IS NOT NULL
+                  AND DATEDIFF(day, prev_order_date, order_date) >= @REACTIVATION_DAYS
+             THEN 1 ELSE 0 END AS is_reactivated,
+        ROW_NUMBER() OVER (
+            PARTITION BY PATIENTCATEGORY, PRODUCTGROUP, DEDUPEID,
+                         DATEFROMPARTS(YEAR(order_date), MONTH(order_date), 1)
+            ORDER BY order_date
+        ) AS rn_in_month
+    FROM seq
 )
 SELECT
-  order_month, PATIENTCATEGORY, PRODUCTGROUP,
-  COUNT(*)                                      AS orders,
-  COUNT(DISTINCT CONCAT(PATIENTCATEGORY,'|',PRODUCTGROUP,'|',order_month,'|',--dedupe scope helper
-                        (SELECT 1)))            AS _scope, -- harmless placeholder, keeps the SELECT standalone
-  COUNT_IF(is_new=1)                            AS new_orders,
-  COUNT_IF(is_repeat=1)                         AS repeat_orders,
-  COUNT_IF(is_reactivated=1)                    AS reactivated_orders,
-  CAST(100.0 * COUNT_IF(is_new=1)        / NULLIF(COUNT(*),0) AS decimal(5,1)) AS new_share_pct,
-  CAST(100.0 * COUNT_IF(is_repeat=1)     / NULLIF(COUNT(*),0) AS decimal(5,1)) AS repeat_share_pct,
-  CAST(100.0 * COUNT_IF(is_reactivated=1)/ NULLIF(COUNT(*),0) AS decimal(5,1)) AS reactivated_share_pct
+    order_month,
+    PATIENTCATEGORY,
+    PRODUCTGROUP,
+
+    /* ORDER-LEVEL COUNTS */
+    COUNT(*)                                                      AS orders,
+    SUM(CASE WHEN is_new = 1         THEN 1 ELSE 0 END)          AS new_orders,
+    SUM(CASE WHEN is_repeat = 1      THEN 1 ELSE 0 END)          AS repeat_orders,
+    SUM(CASE WHEN is_reactivated = 1 THEN 1 ELSE 0 END)          AS reactivated_orders,
+    CAST(100.0 * SUM(CASE WHEN is_new = 1 THEN 1 ELSE 0 END)
+         / NULLIF(COUNT(*),0) AS decimal(5,1))                   AS new_order_share_pct,
+    CAST(100.0 * SUM(CASE WHEN is_repeat = 1 THEN 1 ELSE 0 END)
+         / NULLIF(COUNT(*),0) AS decimal(5,1))                   AS repeat_order_share_pct,
+    CAST(100.0 * SUM(CASE WHEN is_reactivated = 1 THEN 1 ELSE 0 END)
+         / NULLIF(COUNT(*),0) AS decimal(5,1))                   AS reactivated_order_share_pct,
+
+    /* DISTINCT PATIENT COUNTS (based on the FIRST event for that patient in the month) */
+    COUNT(DISTINCT DEDUPEID)                                      AS patients_total,
+    COUNT(DISTINCT CASE WHEN rn_in_month = 1 AND is_new = 1         THEN DEDUPEID END) AS new_patients,
+    COUNT(DISTINCT CASE WHEN rn_in_month = 1 AND is_repeat = 1      THEN DEDUPEID END) AS repeat_patients,
+    COUNT(DISTINCT CASE WHEN rn_in_month = 1 AND is_reactivated = 1 THEN DEDUPEID END) AS reactivated_patients,
+    CAST(100.0 * COUNT(DISTINCT CASE WHEN rn_in_month = 1 AND is_new = 1 THEN DEDUPEID END)
+         / NULLIF(COUNT(DISTINCT DEDUPEID),0) AS decimal(5,1))    AS new_patient_share_pct,
+    CAST(100.0 * COUNT(DISTINCT CASE WHEN rn_in_month = 1 AND is_repeat = 1 THEN DEDUPEID END)
+         / NULLIF(COUNT(DISTINCT DEDUPEID),0) AS decimal(5,1))    AS repeat_patient_share_pct,
+    CAST(100.0 * COUNT(DISTINCT CASE WHEN rn_in_month = 1 AND is_reactivated = 1 THEN DEDUPEID END)
+         / NULLIF(COUNT(DISTINCT DEDUPEID),0) AS decimal(5,1))    AS reactivated_patient_share_pct
+
 FROM flags
 GROUP BY order_month, PATIENTCATEGORY, PRODUCTGROUP
 ORDER BY order_month, PATIENTCATEGORY, PRODUCTGROUP;
-
--- Helper for SQL Server 2019- (no COUNT_IF):
--- Replace COUNT_IF(cond) with SUM(CASE WHEN cond THEN 1 ELSE 0 END)
