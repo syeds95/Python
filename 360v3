@@ -1,116 +1,291 @@
 /* ===========================================================
-   MONTHLY_REORDER_BEHAVIOR
-   - Anchored on the month of the reorder (order_month)
-   - Metrics by Channel × Item_Group
+   CUSTOMER BEHAVIOR MONTHLY METRICS (Copy-Paste Script)
+   Builds 5 monthly tables from existing analytic objects:
+   - Uses: ANL_EVENTS, ANL_REORDER_PAIRS, ANL_LINES, ORDER_ITEMS
    =========================================================== */
 
-CREATE OR REPLACE TABLE MONTHLY_REORDER_BEHAVIOR (
-  order_month                    DATE,
-  channel                        VARCHAR,
-  Item_Group                     VARCHAR,
-  total_orders                   NUMBER(38,0),
-  reorder_orders                 NUMBER(38,0),
-  reorder_share_pct              NUMBER(5,1),
-  reorder_patients               NUMBER(38,0),
-  median_days_since_prior        NUMBER(10,1),
-  median_days_between_orders     NUMBER(10,1),
-  median_delta_vs_eligibility    NUMBER(10,1),
-  early_pct                      NUMBER(5,1),
-  on_time_pct                    NUMBER(5,1),
-  late_8_30_pct                  NUMBER(5,1),
-  late_31_60_pct                 NUMBER(5,1),
-  late_61_90_pct                 NUMBER(5,1),
-  late_gt_90_pct                 NUMBER(5,1),
-  skipped_cycle_pct              NUMBER(5,1),
-  cycle_index_median             NUMBER(10,2),
-  reorder_aov                    NUMBER(38,2)
+-- 0) CONTEXT (edit)
+USE ROLE          <YOUR_ROLE>;
+USE WAREHOUSE     <YOUR_WAREHOUSE>;
+USE DATABASE      <YOUR_DATABASE>;
+USE SCHEMA        <YOUR_SCHEMA>;
+
+/* ===========================================================
+   1) Month spine (distinct months from orders & eligibility)
+   =========================================================== */
+CREATE OR REPLACE TEMP TABLE _MONTHS AS
+SELECT DISTINCT DATE_TRUNC('month', d) AS month_start,
+       LAST_DAY(d)                     AS month_end
+FROM (
+  SELECT order_date AS d FROM ANL_EVENTS
+  UNION
+  SELECT event_next_elig AS d FROM ANL_REORDER_PAIRS WHERE event_next_elig IS NOT NULL
 );
 
-INSERT OVERWRITE INTO MONTHLY_REORDER_BEHAVIOR
+/* ===========================================================
+   2) Monthly acquisition/retention: NEW / REPEAT / REACTIVATED
+   - “Reactivated” = reordered after a gap >= 2 × prior supply
+   =========================================================== */
+CREATE OR REPLACE TABLE PATIENT_LIFECYCLE_MONTHLY (
+  order_month         DATE,
+  channel             VARCHAR,
+  Item_Group          VARCHAR,
+  orders              NUMBER(38,0),
+  patients_total      NUMBER(38,0),
+  new_patients        NUMBER(38,0),
+  repeat_patients     NUMBER(38,0),
+  reactivated_patients NUMBER(38,0),
+  new_share_pct       NUMBER(5,1),
+  repeat_share_pct    NUMBER(5,1),
+  reactivated_share_pct NUMBER(5,1)
+);
+
+INSERT OVERWRITE INTO PATIENT_LIFECYCLE_MONTHLY
 WITH ev AS (
-  /* Classify each order event as first vs reorder; compute prev order & prev supply */
   SELECT
-    e.PatientID,
-    e.channel,
-    e.Item_Group,
-    e.order_date,
+    e.PatientID, e.channel, e.Item_Group, e.order_date,
     DATE_TRUNC('month', e.order_date) AS order_month,
-    e.event_revenue,
-    e.event_supply_days,
-    LAG(e.order_date)       OVER (PARTITION BY e.PatientID, e.Item_Group ORDER BY e.order_date) AS prev_order_date,
-    LAG(e.event_supply_days)OVER (PARTITION BY e.PatientID, e.Item_Group ORDER BY e.order_date) AS prev_supply_days,
-    CASE WHEN LAG(e.order_date) OVER (PARTITION BY e.PatientID, e.Item_Group ORDER BY e.order_date) IS NOT NULL THEN 1 ELSE 0 END AS is_reorder
+    LAG(e.order_date)        OVER (PARTITION BY e.PatientID, e.Item_Group ORDER BY e.order_date) AS prev_order_date,
+    LAG(e.event_supply_days) OVER (PARTITION BY e.PatientID, e.Item_Group ORDER BY e.order_date) AS prev_supply_days
   FROM ANL_EVENTS e
 ),
-re AS (
+flags AS (
   SELECT
-    order_month, channel, Item_Group, PatientID, event_revenue,
-    DATEDIFF('day', prev_order_date, order_date)                           AS days_since_prior,
-    (DATEDIFF('day', prev_order_date, order_date) / NULLIF(prev_supply_days, 0)) AS cycle_index
+    order_month, channel, Item_Group, PatientID,
+    CASE WHEN prev_order_date IS NULL THEN 1 ELSE 0 END AS is_new,
+    CASE WHEN prev_order_date IS NOT NULL THEN 1 ELSE 0 END AS is_repeat,
+    CASE WHEN prev_order_date IS NOT NULL
+              AND DATEDIFF('day', prev_order_date, order_date) >= 2 * COALESCE(prev_supply_days, 30)
+         THEN 1 ELSE 0 END AS is_reactivated
   FROM ev
-  WHERE is_reorder = 1
-),
-totals AS (
-  /* Totals & reorder counts; reorder AOV; recency & cycle stats (reorders only) */
+)
+SELECT
+  order_month, channel, Item_Group,
+  COUNT(*) AS orders,
+  COUNT(DISTINCT PatientID) AS patients_total,
+  COUNT_IF(is_new = 1)     AS new_patients,
+  COUNT_IF(is_repeat = 1)  AS repeat_patients,
+  COUNT_IF(is_reactivated = 1) AS reactivated_patients,
+  ROUND(100.0 * COUNT_IF(is_new=1)        / NULLIF(COUNT(*),0), 1) AS new_share_pct,
+  ROUND(100.0 * COUNT_IF(is_repeat=1)     / NULLIF(COUNT(*),0), 1) AS repeat_share_pct,
+  ROUND(100.0 * COUNT_IF(is_reactivated=1)/ NULLIF(COUNT(*),0), 1) AS reactivated_share_pct
+FROM flags
+GROUP BY 1,2,3
+ORDER BY order_month, channel, Item_Group;
+
+/* ===========================================================
+   3) Monthly ACTIVE / AT-RISK / LOST base (snapshot at month-end)
+   - Active: last order within (supply + 7) days
+   - At-risk: between (supply + 8) and (2 × supply) days
+   - Lost:   > 2 × supply days
+   Also returns revenue and ARPA (revenue per active patient).
+   =========================================================== */
+CREATE OR REPLACE TABLE ACTIVE_RISK_STATUS_MONTHLY (
+  month_start        DATE,
+  channel            VARCHAR,
+  Item_Group         VARCHAR,
+  active_patients    NUMBER(38,0),
+  at_risk_patients   NUMBER(38,0),
+  lost_patients      NUMBER(38,0),
+  revenue_in_month   NUMBER(38,2),
+  arpa_active        NUMBER(38,2)   -- revenue per active patient
+);
+
+INSERT OVERWRITE INTO ACTIVE_RISK_STATUS_MONTHLY
+WITH joined AS (
   SELECT
-    DATE_TRUNC('month', e.order_date)                                      AS order_month,
-    e.channel,
-    e.Item_Group,
-    COUNT(*)                                                                AS total_orders,
-    COUNT_IF(ev.is_reorder = 1)                                             AS reorder_orders,
-    COUNT(DISTINCT CASE WHEN ev.is_reorder = 1 THEN e.PatientID END)        AS reorder_patients,
-    /* Reorder AOV */
-    CAST(SUM(CASE WHEN ev.is_reorder = 1 THEN e.event_revenue ELSE 0 END)
-         / NULLIF(COUNT_IF(ev.is_reorder = 1), 0) AS NUMBER(38,2))          AS reorder_aov,
-    /* Medians among reorders */
-    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY re.days_since_prior), 1)    AS median_days_since_prior,
-    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY re.cycle_index), 2)         AS cycle_index_median,
-    ROUND(100.0 * AVG(CASE WHEN re.cycle_index >= 1.5 THEN 1 ELSE 0 END), 1)      AS skipped_cycle_pct
-  FROM ANL_EVENTS e
-  JOIN ev ON ev.PatientID = e.PatientID AND ev.Item_Group = e.Item_Group AND ev.order_date = e.order_date
-  LEFT JOIN re ON re.order_month = DATE_TRUNC('month', e.order_date) AND re.channel=e.channel AND re.Item_Group=e.Item_Group AND re.PatientID=e.PatientID
+    m.month_start, m.month_end,
+    e.PatientID, e.Item_Group, e.channel,
+    e.order_date, e.event_supply_days
+  FROM _MONTHS m
+  JOIN ANL_EVENTS e
+    ON e.order_date <= m.month_end
+),
+latest AS (
+  SELECT
+    month_start, month_end, PatientID, Item_Group, channel,
+    order_date AS last_order_date,
+    event_supply_days AS supply_days,
+    ROW_NUMBER() OVER (PARTITION BY month_start, PatientID, Item_Group ORDER BY order_date DESC) AS rn
+  FROM joined
+),
+snap AS (
+  SELECT
+    month_start, month_end, PatientID, Item_Group, channel, supply_days,
+    DATEDIFF('day', last_order_date, month_end) AS days_since_last
+  FROM latest
+  WHERE rn = 1
+),
+status AS (
+  SELECT
+    month_start,
+    channel, Item_Group,
+    COUNT_IF(days_since_last <= supply_days + 7)                                             AS active_patients,
+    COUNT_IF(days_since_last >  supply_days + 7 AND days_since_last <= 2 * supply_days)     AS at_risk_patients,
+    COUNT_IF(days_since_last >  2 * supply_days)                                            AS lost_patients
+  FROM snap
   GROUP BY 1,2,3
 ),
-timeliness AS (
-  /* Timeliness distribution & medians, anchored on the month the reorder happened */
+rev AS (
   SELECT
-    DATE_TRUNC('month', next_order_date)                                     AS order_month,
-    channel,
-    Item_Group,
-    COUNT(*)                                                                 AS reorders_in_month,
-    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY days_to_next), 1)      AS median_days_between_orders,
-    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delta_vs_elig), 1)     AS median_delta_vs_eligibility,
-    ROUND(100.0 * AVG(CASE WHEN delta_vs_elig < -7 THEN 1 ELSE 0 END), 1)    AS early_pct,
-    ROUND(100.0 * AVG(CASE WHEN ABS(delta_vs_elig) <= 7 THEN 1 ELSE 0 END), 1) AS on_time_pct,
-    ROUND(100.0 * AVG(CASE WHEN delta_vs_elig BETWEEN 8 AND 30 THEN 1 ELSE 0 END), 1)   AS late_8_30_pct,
-    ROUND(100.0 * AVG(CASE WHEN delta_vs_elig BETWEEN 31 AND 60 THEN 1 ELSE 0 END), 1)  AS late_31_60_pct,
-    ROUND(100.0 * AVG(CASE WHEN delta_vs_elig BETWEEN 61 AND 90 THEN 1 ELSE 0 END), 1)  AS late_61_90_pct,
-    ROUND(100.0 * AVG(CASE WHEN delta_vs_elig > 90 THEN 1 ELSE 0 END), 1)               AS late_gt_90_pct
-  FROM ANL_REORDER_PAIRS
-  WHERE next_order_date IS NOT NULL
+    DATE_TRUNC('month', order_date) AS month_start,
+    channel, Item_Group,
+    CAST(SUM(event_revenue) AS NUMBER(38,2)) AS revenue_in_month
+  FROM ANL_EVENTS
   GROUP BY 1,2,3
 )
 SELECT
-  t.order_month,
-  t.channel,
-  t.Item_Group,
-  t.total_orders,
-  t.reorder_orders,
-  ROUND(100.0 * (t.reorder_orders::FLOAT) / NULLIF(t.total_orders::FLOAT, 0.0), 1) AS reorder_share_pct,
-  t.reorder_patients,
-  t.median_days_since_prior,
-  tm.median_days_between_orders,
-  tm.median_delta_vs_eligibility,
-  tm.early_pct,
-  tm.on_time_pct,
-  tm.late_8_30_pct,
-  tm.late_31_60_pct,
-  tm.late_61_90_pct,
-  tm.late_gt_90_pct,
-  t.skipped_cycle_pct,
-  t.cycle_index_median,
-  t.reorder_aov
-FROM totals t
-LEFT JOIN timeliness tm
-  ON tm.order_month = t.order_month AND tm.channel = t.channel AND tm.Item_Group = t.Item_Group
-ORDER BY t.order_month, t.channel, t.Item_Group;
+  s.month_start, s.channel, s.Item_Group,
+  s.active_patients, s.at_risk_patients, s.lost_patients,
+  COALESCE(r.revenue_in_month, 0) AS revenue_in_month,
+  CASE WHEN s.active_patients > 0
+       THEN ROUND(r.revenue_in_month / s.active_patients, 2)
+       ELSE NULL END AS arpa_active
+FROM status s
+LEFT JOIN rev r
+  ON r.month_start = s.month_start
+ AND r.channel     = s.channel
+ AND r.Item_Group  = s.Item_Group
+ORDER BY month_start, channel, Item_Group;
+
+/* ===========================================================
+   4) New-patient cohort → 2nd-order conversion
+   - For patients whose FIRST order is in month m:
+     * % who place 2nd order within 60 days
+     * % who place 2nd order within (supply + 7) days
+     * median days to 2nd order
+   =========================================================== */
+CREATE OR REPLACE TABLE NEW_COHORT_2ND_ORDER (
+  first_order_month         DATE,
+  channel                   VARCHAR,
+  Item_Group                VARCHAR,
+  new_patients              NUMBER(38,0),
+  conv_within_60_cnt        NUMBER(38,0),
+  conv_within_supply_cnt    NUMBER(38,0),
+  conv_within_60_pct        NUMBER(5,1),
+  conv_within_supply_pct    NUMBER(5,1),
+  median_days_to_second     NUMBER(10,1)
+);
+
+INSERT OVERWRITE INTO NEW_COHORT_2ND_ORDER
+WITH seq AS (
+  SELECT
+    e.PatientID, e.channel, e.Item_Group, e.order_date, e.event_supply_days,
+    ROW_NUMBER() OVER (PARTITION BY e.PatientID, e.Item_Group ORDER BY e.order_date) AS rn,
+    LEAD(e.order_date) OVER (PARTITION BY e.PatientID, e.Item_Group ORDER BY e.order_date) AS next_order_date
+  FROM ANL_EVENTS e
+),
+firsts AS (
+  SELECT
+    DATE_TRUNC('month', order_date) AS first_order_month,
+    channel, Item_Group, PatientID,
+    event_supply_days AS first_supply_days,
+    next_order_date,
+    DATEDIFF('day', order_date, next_order_date) AS days_to_second
+  FROM seq
+  WHERE rn = 1
+)
+SELECT
+  first_order_month, channel, Item_Group,
+  COUNT(*) AS new_patients,
+  COUNT_IF(days_to_second IS NOT NULL AND days_to_second <= 60) AS conv_within_60_cnt,
+  COUNT_IF(days_to_second IS NOT NULL AND days_to_second <= first_supply_days + 7) AS conv_within_supply_cnt,
+  ROUND(100.0 * COUNT_IF(days_to_second IS NOT NULL AND days_to_second <= 60) / NULLIF(COUNT(*),0), 1) AS conv_within_60_pct,
+  ROUND(100.0 * COUNT_IF(days_to_second IS NOT NULL AND days_to_second <= first_supply_days + 7) / NULLIF(COUNT(*),0), 1) AS conv_within_supply_pct,
+  ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY days_to_second), 1) AS median_days_to_second
+FROM firsts
+GROUP BY 1,2,3
+ORDER BY first_order_month, channel, Item_Group;
+
+/* ===========================================================
+   5) Eligibility backlog & aging at month-end (open pipeline)
+   - Eligibilities that have NOT yet converted by that month-end
+   - Aging buckets: 0–3, 4–7, 8–30, 31–60, >60 days since eligibility
+   =========================================================== */
+CREATE OR REPLACE TABLE ELIGIBILITY_BACKLOG_MONTH_END (
+  month_end                  DATE,
+  channel                    VARCHAR,
+  Item_Group                 VARCHAR,
+  open_eligibilities         NUMBER(38,0),
+  age_0_3_cnt                NUMBER(38,0),
+  age_4_7_cnt                NUMBER(38,0),
+  age_8_30_cnt               NUMBER(38,0),
+  age_31_60_cnt              NUMBER(38,0),
+  age_gt_60_cnt              NUMBER(38,0)
+);
+
+INSERT OVERWRITE INTO ELIGIBILITY_BACKLOG_MONTH_END
+WITH pairs AS (
+  SELECT p.channel, p.Item_Group, p.event_next_elig, p.next_order_date
+  FROM ANL_REORDER_PAIRS p
+  WHERE p.event_next_elig IS NOT NULL
+),
+grid AS (
+  SELECT m.month_end, pr.channel, pr.Item_Group, pr.event_next_elig, pr.next_order_date
+  FROM _MONTHS m
+  JOIN pairs pr
+    ON pr.event_next_elig <= m.month_end
+)
+SELECT
+  month_end, channel, Item_Group,
+  COUNT_IF(next_order_date IS NULL OR next_order_date > month_end) AS open_eligibilities,
+  COUNT_IF((next_order_date IS NULL OR next_order_date > month_end)
+           AND DATEDIFF('day', event_next_elig, month_end) BETWEEN 0 AND 3)  AS age_0_3_cnt,
+  COUNT_IF((next_order_date IS NULL OR next_order_date > month_end)
+           AND DATEDIFF('day', event_next_elig, month_end) BETWEEN 4 AND 7)  AS age_4_7_cnt,
+  COUNT_IF((next_order_date IS NULL OR next_order_date > month_end)
+           AND DATEDIFF('day', event_next_elig, month_end) BETWEEN 8 AND 30) AS age_8_30_cnt,
+  COUNT_IF((next_order_date IS NULL OR next_order_date > month_end)
+           AND DATEDIFF('day', event_next_elig, month_end) BETWEEN 31 AND 60) AS age_31_60_cnt,
+  COUNT_IF((next_order_date IS NULL OR next_order_date > month_end)
+           AND DATEDIFF('day', event_next_elig, month_end) > 60)             AS age_gt_60_cnt
+FROM grid
+GROUP BY 1,2,3
+ORDER BY month_end, channel, Item_Group;
+
+/* ===========================================================
+   6) HCPCS concentration & mix (how concentrated is the basket?)
+   - Herfindahl-Hirschman Index (HHI) using line_amount_robust by HCPCS
+   - Top HCPCS share and # of distinct HCPCS each month
+   =========================================================== */
+CREATE OR REPLACE TABLE HCPCS_MIX_CONCENTRATION_MONTHLY (
+  order_month     DATE,
+  channel         VARCHAR,
+  Item_Group      VARCHAR,
+  distinct_hcpcs  NUMBER(38,0),
+  hhi_revenue     NUMBER(10,6),
+  top_hcpcs_share NUMBER(10,6)
+);
+
+INSERT OVERWRITE INTO HCPCS_MIX_CONCENTRATION_MONTHLY
+WITH lines AS (
+  SELECT
+    DATE_TRUNC('month', order_date) AS order_month,
+    channel, Item_Group, HCPCS,
+    SUM(line_amount_robust) AS rev
+  FROM ANL_LINES
+  GROUP BY 1,2,3,4
+),
+shares AS (
+  SELECT
+    order_month, channel, Item_Group, HCPCS, rev,
+    rev / NULLIF(SUM(rev) OVER (PARTITION BY order_month, channel, Item_Group), 0) AS share
+  FROM lines
+)
+SELECT
+  order_month, channel, Item_Group,
+  COUNT(DISTINCT HCPCS) AS distinct_hcpcs,
+  SUM(share * share)    AS hhi_revenue,
+  MAX(share)            AS top_hcpcs_share
+FROM shares
+GROUP BY 1,2,3
+ORDER BY order_month, channel, Item_Group;
+
+/* ===========================================================
+   7) QUICK PREVIEWS
+   =========================================================== */
+SELECT * FROM PATIENT_LIFECYCLE_MONTHLY ORDER BY order_month DESC, channel, Item_Group LIMIT 200;
+SELECT * FROM ACTIVE_RISK_STATUS_MONTHLY ORDER BY month_start DESC, channel, Item_Group LIMIT 200;
+SELECT * FROM NEW_COHORT_2ND_ORDER ORDER BY first_order_month DESC, channel, Item_Group LIMIT 200;
+SELECT * FROM ELIGIBILITY_BACKLOG_MONTH_END ORDER BY month_end DESC, channel, Item_Group LIMIT 200;
+SELECT * FROM HCPCS_MIX_CONCENTRATION_MONTHLY ORDER BY order_month DESC, channel, Item_Group LIMIT 200;
