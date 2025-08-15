@@ -1,50 +1,71 @@
-/* Top 3 HCPCS by revenue per Channel × Item_Group × Month */
-WITH m AS (
+-- Monthly NEW / REPEAT / REACTIVATED per channel × product
+DECLARE @REACTIVATION_DAYS INT = 120; -- adjust if you prefer
+
+WITH base AS (
   SELECT
-    DATE_TRUNC('month', order_date)              AS order_month,
-    channel,
-    Item_Group,
-    HCPCS,
-    SUM(line_amount_robust)                      AS hcpcs_revenue,
-    COUNT(DISTINCT OrderNumber)                  AS orders,
-    COUNT(DISTINCT PatientID)                    AS patients
-  FROM ANL_LINES
-  GROUP BY 1,2,3,4
+    DEDUPEID, ORG_ORDERNUMBER, HCPCS,
+    TRY_CONVERT(date, SERVICEDATE) AS order_date,
+    TRY_CONVERT(decimal(18,2), AMOUNT) AS amount,
+    PRODUCTGROUP, PATIENTCATEGORY
+  FROM TABLEABC
 ),
-seg AS (
-  SELECT order_month, channel, Item_Group, SUM(hcpcs_revenue) AS segment_revenue
-  FROM m
-  GROUP BY 1,2,3
+order_semantics AS (
+  SELECT ORG_ORDERNUMBER,
+         COUNT(*) AS rows_in_order,
+         MIN(amount) AS min_amt,
+         MAX(amount) AS max_amt
+  FROM base
+  GROUP BY ORG_ORDERNUMBER
 ),
-ranked AS (
+robust_lines AS (
   SELECT
-    m.order_month,
-    m.channel,
-    m.Item_Group,
-    m.HCPCS,
-    m.hcpcs_revenue,
-    m.orders,
-    m.patients,
-    s.segment_revenue,
-    DENSE_RANK() OVER (PARTITION BY m.order_month, m.channel, m.Item_Group
-                       ORDER BY m.hcpcs_revenue DESC)                     AS rnk,
-    SUM(m.hcpcs_revenue) OVER (PARTITION BY m.order_month, m.channel, m.Item_Group
-                               ORDER BY m.hcpcs_revenue DESC
-                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_revenue
-  FROM m
-  JOIN seg s USING (order_month, channel, Item_Group)
+    b.DEDUPEID, b.ORG_ORDERNUMBER, b.order_date,
+    b.PRODUCTGROUP, b.PATIENTCATEGORY,
+    CASE WHEN os.rows_in_order > 1 AND os.min_amt = os.max_amt
+         THEN b.amount / NULLIF(os.rows_in_order, 0) ELSE b.amount END AS line_rev
+  FROM base b
+  JOIN order_semantics os ON os.ORG_ORDERNUMBER = b.ORG_ORDERNUMBER
+),
+events AS (  -- one row per patient × product × channel × order
+  SELECT
+    rl.DEDUPEID, rl.PRODUCTGROUP, rl.PATIENTCATEGORY,
+    rl.ORG_ORDERNUMBER, rl.order_date,
+    SUM(rl.line_rev) AS event_revenue
+  FROM robust_lines rl
+  GROUP BY rl.DEDUPEID, rl.PRODUCTGROUP, rl.PATIENTCATEGORY, rl.ORG_ORDERNUMBER, rl.order_date
+),
+seq AS (
+  SELECT
+    e.*,
+    LAG(e.order_date) OVER (PARTITION BY e.DEDUPEID, e.PRODUCTGROUP, e.PATIENTCATEGORY
+                            ORDER BY e.order_date) AS prev_order_date
+  FROM events e
+),
+flags AS (
+  SELECT
+    DATEFROMPARTS(YEAR(order_date), MONTH(order_date), 1) AS order_month,
+    PATIENTCATEGORY, PRODUCTGROUP,
+    CASE WHEN prev_order_date IS NULL THEN 1 ELSE 0 END AS is_new,
+    CASE WHEN prev_order_date IS NOT NULL THEN 1 ELSE 0 END AS is_repeat,
+    CASE WHEN prev_order_date IS NOT NULL
+              AND DATEDIFF(day, prev_order_date, order_date) >= @REACTIVATION_DAYS
+         THEN 1 ELSE 0 END AS is_reactivated
+  FROM seq
 )
 SELECT
-  order_month,
-  channel,
-  Item_Group,
-  HCPCS,
-  hcpcs_revenue,
-  ROUND(100 * (hcpcs_revenue / NULLIF(segment_revenue,0)), 1)  AS rev_share_pct,
-  ROUND(100 * (cum_revenue / NULLIF(segment_revenue,0)), 1)    AS cum_share_pct,
-  orders,
-  patients,
-  rnk
-FROM ranked
-WHERE rnk <= 3   -- keep ties at 3
-ORDER BY order_month, channel, Item_Group, rnk, hcpcs_revenue DESC;
+  order_month, PATIENTCATEGORY, PRODUCTGROUP,
+  COUNT(*)                                      AS orders,
+  COUNT(DISTINCT CONCAT(PATIENTCATEGORY,'|',PRODUCTGROUP,'|',order_month,'|',--dedupe scope helper
+                        (SELECT 1)))            AS _scope, -- harmless placeholder, keeps the SELECT standalone
+  COUNT_IF(is_new=1)                            AS new_orders,
+  COUNT_IF(is_repeat=1)                         AS repeat_orders,
+  COUNT_IF(is_reactivated=1)                    AS reactivated_orders,
+  CAST(100.0 * COUNT_IF(is_new=1)        / NULLIF(COUNT(*),0) AS decimal(5,1)) AS new_share_pct,
+  CAST(100.0 * COUNT_IF(is_repeat=1)     / NULLIF(COUNT(*),0) AS decimal(5,1)) AS repeat_share_pct,
+  CAST(100.0 * COUNT_IF(is_reactivated=1)/ NULLIF(COUNT(*),0) AS decimal(5,1)) AS reactivated_share_pct
+FROM flags
+GROUP BY order_month, PATIENTCATEGORY, PRODUCTGROUP
+ORDER BY order_month, PATIENTCATEGORY, PRODUCTGROUP;
+
+-- Helper for SQL Server 2019- (no COUNT_IF):
+-- Replace COUNT_IF(cond) with SUM(CASE WHEN cond THEN 1 ELSE 0 END)
