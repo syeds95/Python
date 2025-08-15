@@ -1,481 +1,116 @@
 /* ===========================================================
-   HME Analytics + Forecast: Full Build Script (Copy-Paste)
-   - Creates views & tables (explicit DDL) and loads data
-   - End results saved into the tables listed below
+   MONTHLY_REORDER_BEHAVIOR
+   - Anchored on the month of the reorder (order_month)
+   - Metrics by Channel × Item_Group
    =========================================================== */
 
-/* ---- 0) SESSION CONTEXT (edit) ---- */
-USE ROLE          <YOUR_ROLE>;
-USE WAREHOUSE     <YOUR_WAREHOUSE>;
-USE DATABASE      <YOUR_DATABASE>;
-USE SCHEMA        <YOUR_SCHEMA>;
-
-/* ===========================================================
-   1) PREREQ VIEWS (safe to re-run)
-   =========================================================== */
-
-/* View: ORDER_HEADER (one eligibility per order) */
-CREATE OR REPLACE VIEW ORDER_HEADER AS
-SELECT
-  OrderNumber,
-  MAX(CAST(ServiceDateOfOrder AS DATE)) AS order_date,
-  MAX(CAST(NextEligibleToShipDate AS DATE)) AS header_next_elig,
-  MAX(CAST(PatientID AS VARCHAR)) AS PatientID,
-  MAX(CAST(Patient_Group AS VARCHAR)) AS channel,        -- DTC / LINK
-  MAX(CAST(InsuranceName AS VARCHAR)) AS InsuranceName
-FROM ORDERS_TABLE
-GROUP BY OrderNumber;
-
-/* View: ORDER_ITEMS (normalized lines passthrough) */
-CREATE OR REPLACE VIEW ORDER_ITEMS AS
-SELECT
-  CAST(PatientID AS VARCHAR)         AS PatientID,
-  CAST(OrderNumber AS VARCHAR)       AS OrderNumber,
-  CAST(HCPCS AS VARCHAR)             AS HCPCS,
-  CAST(ServiceDateOfOrder AS DATE)   AS ServiceDateOfOrder,
-  CAST(TotalAmount AS NUMBER(38,2))  AS TotalAmount,
-  CAST(TotalQTY AS NUMBER(38,0))     AS TotalQTY,
-  CAST(SupplyDuration AS NUMBER(10,0)) AS SupplyDuration,
-  CAST(InsuranceName AS VARCHAR)     AS InsuranceName,
-  CAST(Patient_Group AS VARCHAR)     AS Patient_Group,   -- DTC / LINK
-  CAST(Item_Group AS VARCHAR)        AS Item_Group,      -- Ostomy / Urology
-  CAST(NextEligibleToShipDate AS DATE) AS NextEligibleToShipDate
-FROM ORDERS_TABLE;
-
-/* ===========================================================
-   2) CORE ANALYTIC VIEWS
-   =========================================================== */
-
-/* View: ANL_LINES (robust per-line revenue + header eligibility) */
-CREATE OR REPLACE VIEW ANL_LINES AS
-WITH base AS (
-  SELECT
-    i.PatientID,
-    i.OrderNumber,
-    i.HCPCS,
-    CAST(i.ServiceDateOfOrder AS DATE)     AS order_date,
-    CAST(i.TotalAmount    AS NUMBER(38,2)) AS total_amount,
-    CAST(i.TotalQTY       AS NUMBER(38,0)) AS qty,
-    CAST(i.SupplyDuration AS NUMBER(10,0)) AS supply_days,
-    i.Patient_Group                             AS channel,     -- DTC / LINK
-    i.Item_Group                                AS Item_Group,  -- Ostomy / Urology
-    i.InsuranceName,
-    h.header_next_elig
-  FROM ORDER_ITEMS i
-  LEFT JOIN ORDER_HEADER h USING (OrderNumber)
-),
-order_semantics AS (
-  SELECT
-    OrderNumber,
-    COUNT(*)          AS rows_in_order,
-    MIN(total_amount) AS min_amt,
-    MAX(total_amount) AS max_amt
-  FROM base
-  GROUP BY 1
-)
-SELECT
-  b.*,
-  /* Avoid revenue double counting if order total repeats per line */
-  CAST(
-    CASE
-      WHEN os.rows_in_order > 1 AND os.min_amt = os.max_amt
-        THEN b.total_amount / NULLIF(os.rows_in_order, 0)
-      ELSE b.total_amount
-    END AS NUMBER(38,2)
-  ) AS line_amount_robust
-FROM base b
-JOIN order_semantics os USING (OrderNumber);
-
-/* View: ANL_EVENTS (1 row per Patient × Product × Order) */
-CREATE OR REPLACE VIEW ANL_EVENTS AS
-SELECT
-  PatientID,
-  channel,
-  Item_Group,
-  InsuranceName,
-  OrderNumber,
-  MIN(order_date)         AS order_date,
-  MAX(header_next_elig)   AS event_next_elig,
-  AVG(supply_days)        AS event_supply_days,
-  SUM(line_amount_robust) AS event_revenue,
-  SUM(qty)                AS event_units
-FROM ANL_LINES
-GROUP BY 1,2,3,4,5;
-
-/* ===========================================================
-   3) PARAMETERS
-   =========================================================== */
--- As-of date comes from ORDER_HEADER
-SET AS_OF_DATE   = (SELECT MAX(order_date) FROM ORDER_HEADER);
-SET HORIZON_DAYS = 90;   -- months ahead (~90 days)
-SET MIN_DELAY_N  = 100;  -- min pairs to trust insurance-level delay
-
-/* ===========================================================
-   4) RESULT TABLES (DDL + LOAD)
-   =========================================================== */
-
-/* ---- 4a) ANL_REORDER_PAIRS ---- */
-CREATE OR REPLACE TABLE ANL_REORDER_PAIRS (
-  channel               VARCHAR,
-  Item_Group            VARCHAR,
-  InsuranceName         VARCHAR,
-  PatientID             VARCHAR,
-  order_date            DATE,
-  event_next_elig       DATE,
-  event_supply_days     NUMBER(10,0),
-  event_revenue         NUMBER(38,2),
-  event_units           NUMBER(38,0),
-  next_order_date       DATE,
-  days_to_next          NUMBER(10,0),
-  delta_vs_elig         NUMBER(10,0)
-);
-
-INSERT INTO ANL_REORDER_PAIRS
-WITH seq AS (
-  SELECT
-    e.*,
-    LEAD(order_date) OVER (PARTITION BY PatientID, Item_Group ORDER BY order_date) AS next_order_date
-  FROM ANL_EVENTS e
-)
-SELECT
-  channel,
-  Item_Group,
-  InsuranceName,
-  PatientID,
-  order_date,
-  event_next_elig,
-  event_supply_days,
-  CAST(event_revenue AS NUMBER(38,2)) AS event_revenue,
-  CAST(event_units   AS NUMBER(38,0)) AS event_units,
-  next_order_date,
-  CAST(DATEDIFF('day', order_date,      next_order_date) AS NUMBER(10,0)) AS days_to_next,
-  CAST(DATEDIFF('day', event_next_elig, next_order_date) AS NUMBER(10,0)) AS delta_vs_elig
-FROM seq;
-
-/* ---- 4b) ANL_CADENCE ---- */
-CREATE OR REPLACE TABLE ANL_CADENCE (
+CREATE OR REPLACE TABLE MONTHLY_REORDER_BEHAVIOR (
+  order_month                    DATE,
   channel                        VARCHAR,
   Item_Group                     VARCHAR,
-  reorder_pairs                  NUMBER(38,0),
-  avg_days_between_orders        NUMBER(10,1),
+  total_orders                   NUMBER(38,0),
+  reorder_orders                 NUMBER(38,0),
+  reorder_share_pct              NUMBER(5,1),
+  reorder_patients               NUMBER(38,0),
+  median_days_since_prior        NUMBER(10,1),
   median_days_between_orders     NUMBER(10,1),
-  avg_delta_vs_eligibility       NUMBER(10,1),
+  median_delta_vs_eligibility    NUMBER(10,1),
+  early_pct                      NUMBER(5,1),
   on_time_pct                    NUMBER(5,1),
-  late_30plus_pct                NUMBER(5,1)
+  late_8_30_pct                  NUMBER(5,1),
+  late_31_60_pct                 NUMBER(5,1),
+  late_61_90_pct                 NUMBER(5,1),
+  late_gt_90_pct                 NUMBER(5,1),
+  skipped_cycle_pct              NUMBER(5,1),
+  cycle_index_median             NUMBER(10,2),
+  reorder_aov                    NUMBER(38,2)
 );
 
-INSERT INTO ANL_CADENCE
-SELECT
-  channel,
-  Item_Group,
-  COUNT_IF(next_order_date IS NOT NULL)                                        AS reorder_pairs,
-  ROUND(AVG(days_to_next), 1)                                                  AS avg_days_between_orders,
-  ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY days_to_next), 1)          AS median_days_between_orders,
-  ROUND(AVG(delta_vs_elig), 1)                                                 AS avg_delta_vs_eligibility,
-  ROUND(100.0 * AVG(CASE WHEN ABS(delta_vs_elig) <= 7 THEN 1 ELSE 0 END), 1)  AS on_time_pct,
-  ROUND(100.0 * AVG(CASE WHEN delta_vs_elig > 30 THEN 1 ELSE 0 END), 1)       AS late_30plus_pct
-FROM ANL_REORDER_PAIRS
-WHERE next_order_date IS NOT NULL
-GROUP BY 1,2
-ORDER BY 1,2;
-
-/* ---- 4c) HAZARD COUNTS (insurance-level) ---- */
-CREATE OR REPLACE TABLE ANL_HAZARD_COUNTS_INS (
-  channel       VARCHAR,
-  Item_Group    VARCHAR,
-  InsuranceName VARCHAR,
-  bucket        VARCHAR,
-  cnt           NUMBER(38,0),
-  total_cnt     NUMBER(38,0)
-);
-
-INSERT INTO ANL_HAZARD_COUNTS_INS
-WITH b AS (
+INSERT OVERWRITE INTO MONTHLY_REORDER_BEHAVIOR
+WITH ev AS (
+  /* Classify each order event as first vs reorder; compute prev order & prev supply */
   SELECT
-    channel, Item_Group, InsuranceName,
-    CASE
-      WHEN next_order_date IS NULL THEN 'No next order'
-      WHEN delta_vs_elig <  -7 THEN 'Early (<-7d)'
-      WHEN delta_vs_elig <= 7  THEN 'On-time (-7..+7)'
-      WHEN delta_vs_elig <= 30 THEN 'Late (8..30)'
-      WHEN delta_vs_elig <= 60 THEN 'Late (31..60)'
-      WHEN delta_vs_elig <= 90 THEN 'Late (61..90)'
-      ELSE 'Late (>90)'
-    END AS bucket
-  FROM ANL_REORDER_PAIRS
-  WHERE event_next_elig IS NOT NULL
-)
-SELECT
-  channel, Item_Group, InsuranceName, bucket,
-  COUNT(*) AS cnt,
-  SUM(COUNT(*)) OVER (PARTITION BY channel, Item_Group, InsuranceName) AS total_cnt
-FROM b
-GROUP BY 1,2,3,4;
-
-/* ---- 4d) HAZARD COUNTS (segment fallback) ---- */
-CREATE OR REPLACE TABLE ANL_HAZARD_COUNTS_SEG (
-  channel    VARCHAR,
-  Item_Group VARCHAR,
-  bucket     VARCHAR,
-  cnt        NUMBER(38,0),
-  total_cnt  NUMBER(38,0)
-);
-
-INSERT INTO ANL_HAZARD_COUNTS_SEG
-WITH b AS (
-  SELECT
-    channel, Item_Group,
-    CASE
-      WHEN next_order_date IS NULL THEN 'No next order'
-      WHEN delta_vs_elig <  -7 THEN 'Early (<-7d)'
-      WHEN delta_vs_elig <= 7  THEN 'On-time (-7..+7)'
-      WHEN delta_vs_elig <= 30 THEN 'Late (8..30)'
-      WHEN delta_vs_elig <= 60 THEN 'Late (31..60)'
-      WHEN delta_vs_elig <= 90 THEN 'Late (61..90)'
-      ELSE 'Late (>90)'
-    END AS bucket
-  FROM ANL_REORDER_PAIRS
-  WHERE event_next_elig IS NOT NULL
-)
-SELECT
-  channel, Item_Group, bucket,
-  COUNT(*) AS cnt,
-  SUM(COUNT(*)) OVER (PARTITION BY channel, Item_Group) AS total_cnt
-FROM b
-GROUP BY 1,2,3;
-
-/* ---- 4e) HAZARD PROBABILITIES (insurance-level) ---- */
-CREATE OR REPLACE TABLE ANL_HAZARD_PROBS_INS (
-  channel       VARCHAR,
-  Item_Group    VARCHAR,
-  InsuranceName VARCHAR,
-  bucket        VARCHAR,
-  prob          FLOAT
-);
-
-INSERT INTO ANL_HAZARD_PROBS_INS
-SELECT
-  channel, Item_Group, InsuranceName, bucket,
-  (cnt::FLOAT)/NULLIF(total_cnt::FLOAT, 0.0) AS prob
-FROM ANL_HAZARD_COUNTS_INS
-WHERE bucket IN ('On-time (-7..+7)','Late (8..30)','Late (31..60)','Late (61..90)');
-
-/* ---- 4f) HAZARD PROBABILITIES (segment fallback) ---- */
-CREATE OR REPLACE TABLE ANL_HAZARD_PROBS_SEG (
-  channel    VARCHAR,
-  Item_Group VARCHAR,
-  bucket     VARCHAR,
-  prob       FLOAT
-);
-
-INSERT INTO ANL_HAZARD_PROBS_SEG
-SELECT
-  channel, Item_Group, bucket,
-  (cnt::FLOAT)/NULLIF(total_cnt::FLOAT, 0.0) AS prob
-FROM ANL_HAZARD_COUNTS_SEG
-WHERE bucket IN ('On-time (-7..+7)','Late (8..30)','Late (31..60)','Late (61..90)');
-
-/* ---- 4g) SEGMENT AOV ---- */
-CREATE OR REPLACE TABLE ANL_SEGMENT_AOV_INS (
-  channel       VARCHAR,
-  Item_Group    VARCHAR,
-  InsuranceName VARCHAR,
-  aov_event     NUMBER(38,2)
-);
-
-INSERT INTO ANL_SEGMENT_AOV_INS
-SELECT
-  channel, Item_Group, InsuranceName,
-  CAST(SUM(event_revenue)/NULLIF(COUNT(*),0) AS NUMBER(38,2)) AS aov_event
-FROM ANL_EVENTS
-GROUP BY 1,2,3;
-
-CREATE OR REPLACE TABLE ANL_SEGMENT_AOV_SEG (
-  channel    VARCHAR,
-  Item_Group VARCHAR,
-  aov_event  NUMBER(38,2)
-);
-
-INSERT INTO ANL_SEGMENT_AOV_SEG
-SELECT
-  channel, Item_Group,
-  CAST(SUM(event_revenue)/NULLIF(COUNT(*),0) AS NUMBER(38,2)) AS aov_event
-FROM ANL_EVENTS
-GROUP BY 1,2;
-
-/* ---- 4h) PATIENT LATEST (Patient × Product) ---- */
-CREATE OR REPLACE TABLE ANL_PATIENT_LATEST (
-  PatientID        VARCHAR,
-  channel          VARCHAR,
-  Item_Group       VARCHAR,
-  InsuranceName    VARCHAR,
-  last_order_date  DATE,
-  next_elig_date   DATE,
-  last_supply_days NUMBER(10,0)
-);
-
-INSERT INTO ANL_PATIENT_LATEST
-WITH r AS (
-  SELECT
-    e.*,
-    ROW_NUMBER() OVER (PARTITION BY PatientID, Item_Group ORDER BY order_date DESC) AS rn
-  FROM ANL_EVENTS e
-)
-SELECT
-  PatientID,
-  channel,
-  Item_Group,
-  InsuranceName,
-  order_date        AS last_order_date,
-  event_next_elig   AS next_elig_date,
-  CAST(event_supply_days AS NUMBER(10,0)) AS last_supply_days
-FROM r
-WHERE rn = 1;
-
-/* ---- 4i) ELIGIBILITY PIPELINE (patient-level; next 30/60/90) ---- */
-CREATE OR REPLACE TABLE ANL_ELIGIBILITY_PIPELINE (
-  channel        VARCHAR,
-  InsuranceName  VARCHAR,
-  elig_next_30   NUMBER(38,0),
-  elig_next_60   NUMBER(38,0),
-  elig_next_90   NUMBER(38,0)
-);
-
-INSERT INTO ANL_ELIGIBILITY_PIPELINE
-SELECT
-  channel,
-  InsuranceName,
-  COUNT_IF(next_elig_date > $AS_OF_DATE AND next_elig_date <= DATEADD('day', 30, $AS_OF_DATE)) AS elig_next_30,
-  COUNT_IF(next_elig_date > $AS_OF_DATE AND next_elig_date <= DATEADD('day', 60, $AS_OF_DATE)) AS elig_next_60,
-  COUNT_IF(next_elig_date > $AS_OF_DATE AND next_elig_date <= DATEADD('day', 90, $AS_OF_DATE)) AS elig_next_90
-FROM ANL_PATIENT_LATEST
-GROUP BY 1,2
-ORDER BY 1,2;
-
-/* ---- 4j) PATIENT PREDICTIONS (predicted next ServiceDateOfOrder) ---- */
-CREATE OR REPLACE TABLE ANL_PATIENT_PREDICTIONS (
-  PatientID                           VARCHAR,
-  channel                             VARCHAR,
-  Item_Group                          VARCHAR,
-  InsuranceName                       VARCHAR,
-  last_order_date                     DATE,
-  next_elig_date                      DATE,
-  predicted_next_ServiceDateOfOrder   DATE
-);
-
-INSERT INTO ANL_PATIENT_PREDICTIONS
-WITH ds_ins AS (
-  SELECT
-    channel, Item_Group, InsuranceName,
-    CAST(ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delta_vs_elig)) AS NUMBER(10,0)) AS p50_delay,
-    COUNT(*) AS n_pairs
-  FROM ANL_REORDER_PAIRS
-  WHERE delta_vs_elig IS NOT NULL
-  GROUP BY 1,2,3
-),
-ds_seg AS (
-  SELECT
-    channel, Item_Group,
-    CAST(ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delta_vs_elig)) AS NUMBER(10,0)) AS p50_delay_default
-  FROM ANL_REORDER_PAIRS
-  WHERE delta_vs_elig IS NOT NULL
-  GROUP BY 1,2
-)
-SELECT
-  c.PatientID,
-  c.channel,
-  c.Item_Group,
-  c.InsuranceName,
-  c.last_order_date,
-  c.next_elig_date,
-  DATEADD(
-    'day',
-    COALESCE(
-      CASE WHEN dsi.n_pairs >= $MIN_DELAY_N THEN dsi.p50_delay END,
-      dss.p50_delay_default,
-      0::NUMBER(10,0)
-    ),
-    c.next_elig_date
-  ) AS predicted_next_ServiceDateOfOrder
-FROM ANL_PATIENT_LATEST c
-LEFT JOIN ds_ins dsi
-  ON dsi.channel=c.channel AND dsi.Item_Group=c.Item_Group AND dsi.InsuranceName=c.InsuranceName
-LEFT JOIN ds_seg dss
-  ON dss.channel=c.channel AND dss.Item_Group=c.Item_Group;
-
-/* ---- 4k) MONTHLY FORECAST (next ~3 months) ---- */
-CREATE OR REPLACE TABLE ANL_FORECAST_MONTHLY (
-  forecast_month   DATE,
-  channel          VARCHAR,
-  Item_Group       VARCHAR,
-  InsuranceName    VARCHAR,
-  expected_orders  NUMBER(38,6),
-  expected_revenue NUMBER(38,2)
-);
-
-INSERT INTO ANL_FORECAST_MONTHLY
-WITH OFFSETS AS (
-  SELECT * FROM (
-    VALUES ('On-time (-7..+7)', 0), ('Late (8..30)', 19), ('Late (31..60)', 45), ('Late (61..90)', 75)
-  ) AS v(bucket, offset_days)
-),
-ELIG AS (
-  SELECT PatientID, channel, Item_Group, InsuranceName, next_elig_date
-  FROM ANL_PATIENT_LATEST
-  WHERE next_elig_date IS NOT NULL
-    AND next_elig_date >  $AS_OF_DATE
-    AND next_elig_date <= DATEADD('day', $HORIZON_DAYS, $AS_OF_DATE)
-),
-HAZ_INS AS (SELECT channel, Item_Group, InsuranceName, bucket, prob FROM ANL_HAZARD_PROBS_INS),
-HAZ_SEG AS (SELECT channel, Item_Group, bucket, prob FROM ANL_HAZARD_PROBS_SEG),
-PARTICLES AS (
-  SELECT
+    e.PatientID,
     e.channel,
     e.Item_Group,
-    e.InsuranceName,
-    DATEADD('day', off.offset_days, e.next_elig_date) AS expected_date,
-    COALESCE(hi.prob, hs.prob, 0.0)                   AS prob
-  FROM ELIG e
-  JOIN OFFSETS off ON 1=1
-  LEFT JOIN HAZ_INS hi
-    ON hi.channel=e.channel AND hi.Item_Group=e.Item_Group AND hi.InsuranceName=e.InsuranceName AND hi.bucket = off.bucket
-  LEFT JOIN HAZ_SEG hs
-    ON hs.channel=e.channel AND hs.Item_Group=e.Item_Group AND hs.bucket = off.bucket
-  WHERE DATEADD('day', off.offset_days, e.next_elig_date) >  $AS_OF_DATE
-    AND DATEADD('day', off.offset_days, e.next_elig_date) <= DATEADD('day', $HORIZON_DAYS, $AS_OF_DATE)
+    e.order_date,
+    DATE_TRUNC('month', e.order_date) AS order_month,
+    e.event_revenue,
+    e.event_supply_days,
+    LAG(e.order_date)       OVER (PARTITION BY e.PatientID, e.Item_Group ORDER BY e.order_date) AS prev_order_date,
+    LAG(e.event_supply_days)OVER (PARTITION BY e.PatientID, e.Item_Group ORDER BY e.order_date) AS prev_supply_days,
+    CASE WHEN LAG(e.order_date) OVER (PARTITION BY e.PatientID, e.Item_Group ORDER BY e.order_date) IS NOT NULL THEN 1 ELSE 0 END AS is_reorder
+  FROM ANL_EVENTS e
 ),
-AOV_INS AS (SELECT channel, Item_Group, InsuranceName, aov_event FROM ANL_SEGMENT_AOV_INS),
-AOV_SEG AS (SELECT channel, Item_Group, aov_event FROM ANL_SEGMENT_AOV_SEG)
+re AS (
+  SELECT
+    order_month, channel, Item_Group, PatientID, event_revenue,
+    DATEDIFF('day', prev_order_date, order_date)                           AS days_since_prior,
+    (DATEDIFF('day', prev_order_date, order_date) / NULLIF(prev_supply_days, 0)) AS cycle_index
+  FROM ev
+  WHERE is_reorder = 1
+),
+totals AS (
+  /* Totals & reorder counts; reorder AOV; recency & cycle stats (reorders only) */
+  SELECT
+    DATE_TRUNC('month', e.order_date)                                      AS order_month,
+    e.channel,
+    e.Item_Group,
+    COUNT(*)                                                                AS total_orders,
+    COUNT_IF(ev.is_reorder = 1)                                             AS reorder_orders,
+    COUNT(DISTINCT CASE WHEN ev.is_reorder = 1 THEN e.PatientID END)        AS reorder_patients,
+    /* Reorder AOV */
+    CAST(SUM(CASE WHEN ev.is_reorder = 1 THEN e.event_revenue ELSE 0 END)
+         / NULLIF(COUNT_IF(ev.is_reorder = 1), 0) AS NUMBER(38,2))          AS reorder_aov,
+    /* Medians among reorders */
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY re.days_since_prior), 1)    AS median_days_since_prior,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY re.cycle_index), 2)         AS cycle_index_median,
+    ROUND(100.0 * AVG(CASE WHEN re.cycle_index >= 1.5 THEN 1 ELSE 0 END), 1)      AS skipped_cycle_pct
+  FROM ANL_EVENTS e
+  JOIN ev ON ev.PatientID = e.PatientID AND ev.Item_Group = e.Item_Group AND ev.order_date = e.order_date
+  LEFT JOIN re ON re.order_month = DATE_TRUNC('month', e.order_date) AND re.channel=e.channel AND re.Item_Group=e.Item_Group AND re.PatientID=e.PatientID
+  GROUP BY 1,2,3
+),
+timeliness AS (
+  /* Timeliness distribution & medians, anchored on the month the reorder happened */
+  SELECT
+    DATE_TRUNC('month', next_order_date)                                     AS order_month,
+    channel,
+    Item_Group,
+    COUNT(*)                                                                 AS reorders_in_month,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY days_to_next), 1)      AS median_days_between_orders,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delta_vs_elig), 1)     AS median_delta_vs_eligibility,
+    ROUND(100.0 * AVG(CASE WHEN delta_vs_elig < -7 THEN 1 ELSE 0 END), 1)    AS early_pct,
+    ROUND(100.0 * AVG(CASE WHEN ABS(delta_vs_elig) <= 7 THEN 1 ELSE 0 END), 1) AS on_time_pct,
+    ROUND(100.0 * AVG(CASE WHEN delta_vs_elig BETWEEN 8 AND 30 THEN 1 ELSE 0 END), 1)   AS late_8_30_pct,
+    ROUND(100.0 * AVG(CASE WHEN delta_vs_elig BETWEEN 31 AND 60 THEN 1 ELSE 0 END), 1)  AS late_31_60_pct,
+    ROUND(100.0 * AVG(CASE WHEN delta_vs_elig BETWEEN 61 AND 90 THEN 1 ELSE 0 END), 1)  AS late_61_90_pct,
+    ROUND(100.0 * AVG(CASE WHEN delta_vs_elig > 90 THEN 1 ELSE 0 END), 1)               AS late_gt_90_pct
+  FROM ANL_REORDER_PAIRS
+  WHERE next_order_date IS NOT NULL
+  GROUP BY 1,2,3
+)
 SELECT
-  DATE_TRUNC('month', p.expected_date)                                   AS forecast_month,
-  p.channel,
-  p.Item_Group,
-  p.InsuranceName,
-  CAST(SUM(p.prob) AS NUMBER(38,6))                                      AS expected_orders,
-  CAST(SUM(p.prob * COALESCE(ai.aov_event, asg.aov_event, 0::NUMBER(38,2))) AS NUMBER(38,2)) AS expected_revenue
-FROM PARTICLES p
-LEFT JOIN AOV_INS ai
-  ON ai.channel=p.channel AND ai.Item_Group=p.Item_Group AND ai.InsuranceName=p.InsuranceName
-LEFT JOIN AOV_SEG asg
-  ON asg.channel=p.channel AND asg.Item_Group=p.Item_Group
-GROUP BY 1,2,3,4
-ORDER BY forecast_month, channel, Item_Group, InsuranceName;
-
-/* ===========================================================
-   5) QUICK PREVIEWS
-   =========================================================== */
--- Check cadence KPIs
-SELECT * FROM ANL_CADENCE ORDER BY channel, Item_Group;
-
--- Next 3 months (by month × channel × product)
-SELECT forecast_month, channel, Item_Group,
-       SUM(expected_orders) AS orders,
-       SUM(expected_revenue) AS revenue
-FROM ANL_FORECAST_MONTHLY
-GROUP BY 1,2,3
-ORDER BY 1,2,3;
-
--- First 25 predicted next orders
-SELECT * FROM ANL_PATIENT_PREDICTIONS
-ORDER BY predicted_next_ServiceDateOfOrder
-LIMIT 25;
+  t.order_month,
+  t.channel,
+  t.Item_Group,
+  t.total_orders,
+  t.reorder_orders,
+  ROUND(100.0 * (t.reorder_orders::FLOAT) / NULLIF(t.total_orders::FLOAT, 0.0), 1) AS reorder_share_pct,
+  t.reorder_patients,
+  t.median_days_since_prior,
+  tm.median_days_between_orders,
+  tm.median_delta_vs_eligibility,
+  tm.early_pct,
+  tm.on_time_pct,
+  tm.late_8_30_pct,
+  tm.late_31_60_pct,
+  tm.late_61_90_pct,
+  tm.late_gt_90_pct,
+  t.skipped_cycle_pct,
+  t.cycle_index_median,
+  t.reorder_aov
+FROM totals t
+LEFT JOIN timeliness tm
+  ON tm.order_month = t.order_month AND tm.channel = t.channel AND tm.Item_Group = t.Item_Group
+ORDER BY t.order_month, t.channel, t.Item_Group;
