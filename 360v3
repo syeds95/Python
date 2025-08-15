@@ -1,1 +1,189 @@
-a
+/* ===========================================================
+   ONE SCRIPT: Build & Load ORDERS_TABLE from your SELECT
+   - Full refresh (CREATE OR REPLACE)
+   - Normalizes types, parses dates, light de-dupe
+   - Standardizes channel (DTC/LINK) and product (Ostomy/Urology)
+   - Creates helper views: ORDER_HEADER, ORDER_ITEMS
+   =========================================================== */
+
+/* ---- 1) SESSION CONTEXT (edit to match your env) ---- */
+USE ROLE          <YOUR_ROLE>;
+USE WAREHOUSE     <YOUR_WAREHOUSE>;
+USE DATABASE      <YOUR_DATABASE>;
+USE SCHEMA        <YOUR_SCHEMA>;
+
+/* ---- 2) CREATE OR REPLACE TARGET TABLE VIA CTAS ----
+   Replace the SOURCE SELECT in raw_source with your current query.
+   Keep the column aliases/names identical to those shown below.
+---------------------------------------------------------------- */
+CREATE OR REPLACE TABLE ORDERS_TABLE AS
+WITH raw_source AS (
+  /* >>>>>>>>>>>>>>>>>>  PUT YOUR EXISTING SELECT HERE  <<<<<<<<<<<<<<<<<<
+     It must output these columns (any data types; strings OK).
+     Example shape:
+
+     SELECT
+       PatientID,
+       OrderNumber,
+       HCPCS,
+       ServiceDateOfOrder,
+       TotalAmount,
+       TotalQTY,
+       SupplyDuration,
+       InsuranceName,
+       Patient_Group,      -- DTC / LINK (or raw values you want normalized)
+       Item_Group,         -- Ostomy / Urology (or raw values you want normalized)
+       NextEligibleToShipDate
+     FROM SOURCE_DB.SCHEMA.SOURCE_VIEW_OR_TABLE
+  */
+  SELECT
+    PatientID,
+    OrderNumber,
+    HCPCS,
+    ServiceDateOfOrder,
+    TotalAmount,
+    TotalQTY,
+    SupplyDuration,
+    InsuranceName,
+    Patient_Group,
+    Item_Group,
+    NextEligibleToShipDate
+  FROM SOURCE_DB.SCHEMA.SOURCE_TABLE_OR_VIEW
+  /* <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< */
+),
+
+/* ---- 3) TYPE NORMALIZATION & STANDARDIZATION ---------------------- */
+norm AS (
+  SELECT
+    /* Keys & descriptors */
+    TRIM(CAST(PatientID   AS VARCHAR))                            AS PatientID,
+    TRIM(CAST(OrderNumber AS VARCHAR))                            AS OrderNumber,
+    UPPER(TRIM(CAST(HCPCS AS VARCHAR)))                           AS HCPCS,
+
+    /* Dates (flexible parsing) */
+    COALESCE(
+      TRY_TO_DATE(ServiceDateOfOrder),
+      TRY_TO_DATE(ServiceDateOfOrder, 'YYYY-MM-DD'),
+      TRY_TO_DATE(ServiceDateOfOrder, 'YYYY/MM/DD'),
+      TRY_TO_DATE(ServiceDateOfOrder, 'MM/DD/YYYY'),
+      TRY_TO_DATE(ServiceDateOfOrder, 'YYYYMMDD'),
+      TRY_TO_DATE(ServiceDateOfOrder, 'DD-MON-YYYY')
+    )                                                             AS ServiceDateOfOrder,
+
+    /* Amounts / quantities */
+    TRY_TO_DECIMAL(REGEXP_REPLACE(CAST(TotalAmount AS VARCHAR), '[^0-9\\.-]', ''), 38, 2) AS TotalAmount,
+    TRY_TO_NUMBER (REGEXP_REPLACE(CAST(TotalQTY    AS VARCHAR), '[^0-9\\.-]', ''))        AS TotalQTY,
+    TRY_TO_NUMBER (REGEXP_REPLACE(CAST(SupplyDuration AS VARCHAR), '[^0-9\\.-]', ''))     AS SupplyDuration,
+
+    /* Insurance */
+    NULLIF(TRIM(CAST(InsuranceName AS VARCHAR)), '')             AS InsuranceName,
+
+    /* Channel standardization (DTC / LINK) */
+    CASE UPPER(TRIM(CAST(Patient_Group AS VARCHAR)))
+      WHEN 'DTC' THEN 'DTC'
+      WHEN 'DIRECT TO CONSUMER' THEN 'DTC'
+      WHEN 'DIRECT-TO-CONSUMER' THEN 'DTC'
+      WHEN 'LINK' THEN 'LINK'
+      WHEN 'HOSPITAL' THEN 'LINK'
+      WHEN 'HOSPITAL/3RD PARTY' THEN 'LINK'
+      ELSE NULLIF(TRIM(CAST(Patient_Group AS VARCHAR)), '')
+    END                                                          AS Patient_Group,
+
+    /* Product group standardization (Ostomy / Urology) */
+    CASE UPPER(TRIM(CAST(Item_Group AS VARCHAR)))
+      WHEN 'OSTOMY'  THEN 'Ostomy'
+      WHEN 'UROLOGY' THEN 'Urology'
+      ELSE INITCAP(NULLIF(TRIM(CAST(Item_Group AS VARCHAR)), ''))
+    END                                                          AS Item_Group,
+
+    /* Next eligible to ship (order-level; may be present on only one line in source) */
+    COALESCE(
+      TRY_TO_DATE(NextEligibleToShipDate),
+      TRY_TO_DATE(NextEligibleToShipDate, 'YYYY-MM-DD'),
+      TRY_TO_DATE(NextEligibleToShipDate, 'YYYY/MM/DD'),
+      TRY_TO_DATE(NextEligibleToShipDate, 'MM/DD/YYYY'),
+      TRY_TO_DATE(NextEligibleToShipDate, 'YYYYMMDD'),
+      TRY_TO_DATE(NextEligibleToShipDate, 'DD-MON-YYYY')
+    )                                                             AS NextEligibleToShipDate
+  FROM raw_source
+),
+
+/* ---- 4) LIGHT DEDUPE ----------------------------------------------
+   If the source contains duplicate lines for the same natural key
+   (PatientID, OrderNumber, HCPCS, ServiceDateOfOrder), keep the row
+   with a non-null NextEligibleToShipDate; tie-break by larger amount/qty.
+-------------------------------------------------------------------- */
+dedup AS (
+  SELECT
+    n.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        n.PatientID, n.OrderNumber, n.HCPCS, n.ServiceDateOfOrder
+      ORDER BY
+        CASE WHEN n.NextEligibleToShipDate IS NOT NULL THEN 1 ELSE 2 END,
+        COALESCE(n.TotalAmount, 0) DESC,
+        COALESCE(n.TotalQTY, 0)    DESC
+    ) AS rn
+  FROM norm n
+)
+
+/* ---- 5) FINAL SHAPE & TYPES -------------------------------------- */
+SELECT
+  PatientID                                  :: VARCHAR      AS PatientID,
+  OrderNumber                                :: VARCHAR      AS OrderNumber,
+  HCPCS                                      :: VARCHAR      AS HCPCS,
+  ServiceDateOfOrder                         :: DATE         AS ServiceDateOfOrder,
+  TotalAmount                                :: NUMBER(38,2) AS TotalAmount,
+  TotalQTY                                   :: NUMBER(38,0) AS TotalQTY,
+  SupplyDuration                             :: NUMBER(10,0) AS SupplyDuration,
+  InsuranceName                              :: VARCHAR      AS InsuranceName,
+  Patient_Group                              :: VARCHAR      AS Patient_Group,   -- DTC / LINK
+  Item_Group                                 :: VARCHAR      AS Item_Group,      -- Ostomy / Urology
+  NextEligibleToShipDate                     :: DATE         AS NextEligibleToShipDate
+FROM dedup
+WHERE rn = 1
+;
+
+/* ---- 6) METADATA (optional but helpful) -------------------------- */
+COMMENT ON TABLE ORDERS_TABLE IS
+  'Line-level orders for HME: normalized types and standardized Channel/Product. NextEligibleToShipDate is order-level in the source.';
+
+/* ---- 7) OPTIONAL INDEXING (Search Optimization) ------------------ */
+/* Uncomment if you have large data & many equality filters on these fields
+ALTER TABLE ORDERS_TABLE ADD SEARCH OPTIMIZATION ON EQUALITY(
+  PatientID, OrderNumber, ServiceDateOfOrder, NextEligibleToShipDate, Item_Group, Patient_Group
+);
+*/
+
+/* ---- 8) HELPER VIEWS FOR ANALYSIS/FORECAST QUERIES -------------- */
+/* View: order header with one eligibility per order */
+CREATE OR REPLACE VIEW ORDER_HEADER AS
+SELECT
+  OrderNumber,
+  MAX(ServiceDateOfOrder)   AS order_date,
+  MAX(NextEligibleToShipDate) AS header_next_elig,
+  MAX(PatientID)            AS PatientID,
+  MAX(Patient_Group)        AS channel,       -- DTC / LINK
+  MAX(InsuranceName)        AS InsuranceName
+FROM ORDERS_TABLE
+GROUP BY OrderNumber;
+
+/* View: items (simply exposes the normalized lines) */
+CREATE OR REPLACE VIEW ORDER_ITEMS AS
+SELECT * FROM ORDERS_TABLE;
+
+/* ---- 9) QUICK SANITY CHECKS ------------------------------------- */
+-- Row count
+SELECT 'ORDERS_TABLE rows' AS metric, COUNT(*) AS value FROM ORDERS_TABLE;
+
+-- Nulls on critical keys
+SELECT
+  SUM(CASE WHEN PatientID IS NULL THEN 1 ELSE 0 END)        AS null_patientid,
+  SUM(CASE WHEN OrderNumber IS NULL THEN 1 ELSE 0 END)      AS null_ordernumber,
+  SUM(CASE WHEN HCPCS IS NULL THEN 1 ELSE 0 END)            AS null_hcpcs,
+  SUM(CASE WHEN ServiceDateOfOrder IS NULL THEN 1 ELSE 0 END) AS null_service_date
+FROM ORDERS_TABLE;
+
+
+
+
